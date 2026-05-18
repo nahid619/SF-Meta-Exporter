@@ -11,12 +11,13 @@ import { useExport }  from '@/hooks/useExport'
 export default function PicklistExporterPage() {
   const [selected,   setSelected]   = useState([])
   const [exportMode, setExportMode] = useState('single_tab')
+  const [csvMode,     setCsvMode]     = useState(false)
 
   const { isRunning, progress, downloadUrl, stats, error, startExport, cancel } = useExport()
 
   function handleExport() {
     if (!selected.length) return
-    startExport('/api/picklist/export', { objects: selected, exportMode })
+    startExport('/api/picklist/export', { objects: selected, exportMode, csvMode })
   }
 
   const hasActivity = isRunning || progress || downloadUrl || error
@@ -70,6 +71,30 @@ export default function PicklistExporterPage() {
               onChange={setSelected}
               disabled={isRunning}
               fillHeight
+              extraNode={
+                <label style={{
+                  display: 'flex', alignItems: 'center', gap: '6px',
+                  padding: '3px 10px',
+                  background: csvMode ? 'rgba(56,139,253,0.12)' : 'var(--bg-card)',
+                  border: `1px solid ${csvMode ? 'var(--accent)' : 'var(--border-hi)'}`,
+                  borderRadius: '20px',
+                  cursor: isRunning ? 'not-allowed' : 'pointer',
+                  transition: 'all 0.15s', whiteSpace: 'nowrap',
+                }}>
+                  <input
+                    type="checkbox" checked={csvMode}
+                    onChange={e => {
+                      setCsvMode(e.target.checked)
+                      if (e.target.checked && exportMode === 'multi_tab') setExportMode('single_tab')
+                    }}
+                    disabled={isRunning}
+                    style={{ accentColor: 'var(--accent)', cursor: isRunning ? 'not-allowed' : 'pointer' }}
+                  />
+                  <span style={{ fontSize: '11.5px', fontWeight: 500, color: csvMode ? '#bfdbfe' : '#c9d1d9' }}>
+                    CSV Mode
+                  </span>
+                </label>
+              }
             />
           </div>
 
@@ -83,23 +108,31 @@ export default function PicklistExporterPage() {
             <div style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--text-3)', marginBottom: '8px' }}>
               Export Format
             </div>
-            <div className="seg-control" style={{ marginBottom: '12px' }}>
+
+            {/* 3 mode buttons */}
+            <div style={{ display: 'flex', gap: '4px', marginBottom: '8px' }}>
               {[
                 { value: 'single_tab', label: 'Single Tab',  sub: 'All in one sheet' },
-                { value: 'multi_tab',  label: 'Multi-Tab',   sub: 'Sheet per object' },
-              ].map(opt => (
-                <button
-                  key={opt.value} type="button"
-                  className={`seg-btn ${exportMode === opt.value ? 'active' : ''}`}
-                  onClick={() => setExportMode(opt.value)}
-                  disabled={isRunning}
-                  style={{ flexDirection: 'column', gap: '2px', paddingTop: '7px', paddingBottom: '7px' }}
-                >
-                  <span style={{ fontWeight: 600 }}>{opt.label}</span>
-                  <span style={{ fontSize: '10px', opacity: 0.7 }}>{opt.sub}</span>
-                </button>
-              ))}
+                { value: 'multi_tab',  label: 'Multi-Tab',   sub: 'Sheet per object', disabledWhenCsv: true },
+                { value: 'multi_file', label: 'Multi-File',  sub: 'ZIP per object' },
+              ].map(opt => {
+                const isDisabled = isRunning || (csvMode && opt.disabledWhenCsv)
+                return (
+                  <button
+                    key={opt.value} type="button"
+                    className={`seg-btn ${exportMode === opt.value && !isDisabled ? 'active' : ''}`}
+                    onClick={() => { if (!isDisabled) setExportMode(opt.value) }}
+                    disabled={isDisabled}
+                    title={csvMode && opt.disabledWhenCsv ? 'Not available in CSV mode' : ''}
+                    style={{ flex: 1, flexDirection: 'column', gap: '2px', paddingTop: '7px', paddingBottom: '7px', opacity: isDisabled ? 0.35 : 1 }}
+                  >
+                    <span style={{ fontWeight: 600, fontSize: '11.5px' }}>{opt.label}</span>
+                    <span style={{ fontSize: '10px', opacity: 0.75 }}>{opt.sub}</span>
+                  </button>
+                )
+              })}
             </div>
+
 
             <ExportButton
               onClick={handleExport}
@@ -240,7 +273,16 @@ export default function PicklistExporterPage() {
                 </div>
                 <ProgressBar progress={progress} isRunning={false} />
                 <StatsSummary stats={stats} title="Picklist Export Summary" />
-                <DownloadButton url={downloadUrl} label="Download Excel File" />
+                <DownloadButton
+                  url={downloadUrl}
+                  label={
+                    exportMode === 'multi_file'
+                      ? `Download ZIP Archive (${csvMode ? 'CSV files' : 'Excel files'})`
+                      : csvMode
+                        ? 'Download CSV File'
+                        : 'Download Excel File (.xlsx)'
+                  }
+                />
               </>
             )}
           </div>

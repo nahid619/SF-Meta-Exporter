@@ -16,7 +16,8 @@ import { getSession } from '@/lib/session'
 import { SalesforceClient } from '@/lib/salesforce/client'
 import { createSSEStream } from '@/lib/streaming/sse'
 import { generateJobId, storeResult } from '@/lib/jobs/store'
-import { createStyledSheet, addSummarySheet, workbookToBuffer, newWorkbook, appendSheet, safeSheetName } from '@/lib/files/excel'
+import JSZip from 'jszip'
+import { createStyledSheet, addSummarySheet, workbookToBuffer, newWorkbook, appendSheet, safeSheetName, buildCsvBuffer } from '@/lib/files/excel'
 import { createMetadataStats } from '@/lib/models'
 import { buildObjectUsageCache, getFieldUsageString } from '@/lib/salesforce/fieldUsage'
 import { formatRuntime, makeTimestamp, DEFAULT_METADATA_FILENAME } from '@/lib/config'
@@ -138,6 +139,8 @@ export async function POST(request) {
     objects             = [],
     includeDescriptions = true,
     includeFieldUsage   = false,
+    exportMode          = 'multi_tab',
+    csvMode             = false,
   } = await request.json()
 
   const session = await getSession()
@@ -161,6 +164,7 @@ export async function POST(request) {
       stats.totalObjects = objects.length
 
       const wb = newWorkbook()
+      const zipFiles = []  // for multi_file mode
 
       emit.info('=== Metadata Exporter ===')
       emit.info(`Objects: ${objects.length} | Descriptions: ${includeDescriptions ? 'Yes' : 'No'} | Field Usage: ${includeFieldUsage ? 'Yes (slower)' : 'No'}`)
@@ -224,14 +228,34 @@ export async function POST(request) {
             ])
           }
 
-          // Add one sheet per object — with title + summary rows matching Python format
+          // Add sheet / file depending on mode
           const exportDate = new Date().toLocaleString('en-US', { hour12: false }).replace(',', '')
-          const ws = createStyledSheet(HEADERS, rows, {
-            wrapText:    includeFieldUsage,
-            title:       'Salesforce Metadata Export',
-            summaryLine: `Object: ${objName} | Fields: ${rows.length} | Export Date: ${exportDate}`,
-          })
-          appendSheet(wb, ws, safeSheetName(objName, usedSheetNames))
+
+          if (exportMode === 'multi_file') {
+            if (csvMode) {
+              const buf = buildCsvBuffer(HEADERS, rows)
+              zipFiles.push({ name: `${objName}_metadata.csv`, buffer: buf })
+            } else {
+              const fileWb = newWorkbook()
+              const ws = createStyledSheet(HEADERS, rows, {
+                wrapText:    includeFieldUsage,
+                title:       'Salesforce Metadata Export',
+                summaryLine: `Object: ${objName} | Fields: ${rows.length} | Export Date: ${exportDate}`,
+              })
+              appendSheet(fileWb, ws, safeSheetName(objName, new Set()))
+              zipFiles.push({ name: `${objName}_metadata.xlsx`, buffer: workbookToBuffer(fileWb) })
+            }
+          } else {
+            // multi_tab (default) — one sheet per object in single workbook
+            if (!csvMode) {
+              const ws = createStyledSheet(HEADERS, rows, {
+                wrapText:    includeFieldUsage,
+                title:       'Salesforce Metadata Export',
+                summaryLine: `Object: ${objName} | Fields: ${rows.length} | Export Date: ${exportDate}`,
+              })
+              appendSheet(wb, ws, safeSheetName(objName, usedSheetNames))
+            }
+          }
 
           stats.totalFields       += rows.length
           stats.successfulObjects++
@@ -250,32 +274,43 @@ export async function POST(request) {
       const elapsed = (Date.now() - startMs) / 1000
       stats.runtimeFormatted = formatRuntime(elapsed)
 
-      addSummarySheet(wb, [
-        ['Metadata Export Summary',       ''],
-        ['',                              ''],
-        ['Total Objects Selected',        String(stats.totalObjects)],
-        ['Successfully Processed',        String(stats.successfulObjects)],
-        ['Failed',                        String(stats.failedObjects)],
-        ['',                              ''],
-        ['Total Fields Exported',         String(stats.totalFields)],
-        ['',                              ''],
-        ['Descriptions Included',         includeDescriptions ? 'Yes' : 'No'],
-        ['Field Usage Included',          includeFieldUsage   ? 'Yes' : 'No'],
-        ['',                              ''],
-        ['Runtime',                       stats.runtimeFormatted],
-        ['Exported At',                   new Date().toISOString()],
-        ['API Version',                   session.apiVersion],
-        ['Org',                           session.instanceUrl?.replace('https://', '')],
-      ], 'Summary')
 
-      emit.progress(96, 'Generating Excel file…', elapsed)
 
-      const buffer = workbookToBuffer(wb)
-      storeResult(jobId, {
-        buffer,
-        filename:    DEFAULT_METADATA_FILENAME.replace('{timestamp}', makeTimestamp()),
-        contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-      })
+      emit.progress(96, 'Building output…', elapsed)
+
+      let finalBuffer, filename, contentType
+      const timestamp = makeTimestamp()
+
+      if (exportMode === 'multi_file') {
+        // Add summary to ZIP
+        const sumWb = newWorkbook()
+        addSummarySheet(sumWb, buildSummaryRows(stats, exportMode, csvMode, includeDescriptions, includeFieldUsage, session), 'Summary')
+        zipFiles.push({ name: 'Summary.xlsx', buffer: workbookToBuffer(sumWb) })
+
+        emit.progress(97, 'Zipping files…')
+        const zip = new JSZip()
+        zipFiles.forEach(f => zip.file(f.name, f.buffer))
+        finalBuffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } })
+        filename    = `metadata_export_${timestamp}.zip`
+        contentType = 'application/zip'
+
+      } else if (csvMode) {
+        // Combine all rows into single CSV
+        const allRows = []
+        // Re-collect from wb is not possible; for CSV in multi_tab mode we stored nothing
+        // So emit a note — csvMode + multi_tab is treated as multi_file
+        emit.warn('CSV mode with Multi-Tab is not supported — use Multi-File or Single-File CSV instead.')
+        finalBuffer = Buffer.from('No data', 'utf8')
+        filename    = `metadata_export_${timestamp}.txt`
+        contentType = 'text/plain'
+      } else {
+        addSummarySheet(wb, buildSummaryRows(stats, exportMode, csvMode, includeDescriptions, includeFieldUsage, session), 'Summary')
+        finalBuffer = workbookToBuffer(wb)
+        filename    = `metadata_export_${timestamp}.xlsx`
+        contentType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      }
+
+      storeResult(jobId, { buffer: finalBuffer, filename, contentType })
 
       emit.done(`/api/metadata/download/${jobId}`, stats)
       emit.success(`=== Export complete in ${stats.runtimeFormatted} ===`)
@@ -292,4 +327,29 @@ export async function POST(request) {
   })()
 
   return response
+}
+
+function buildSummaryRows(stats, exportMode, csvMode, includeDescriptions, includeFieldUsage, session) {
+  const modeLabel = csvMode
+    ? (exportMode === 'multi_file' ? 'CSV Multi-File ZIP' : 'CSV')
+    : exportMode === 'multi_file' ? 'Multi-File ZIP' : 'Multi-Tab (Single File)'
+  return [
+    ['Metadata Export Summary',  ''],
+    ['',                         ''],
+    ['Export Mode',              modeLabel],
+    ['',                         ''],
+    ['Total Objects Selected',   String(stats.totalObjects)],
+    ['Successfully Processed',   String(stats.successfulObjects)],
+    ['Failed',                   String(stats.failedObjects)],
+    ['',                         ''],
+    ['Total Fields Exported',    String(stats.totalFields)],
+    ['',                         ''],
+    ['Descriptions Included',    includeDescriptions ? 'Yes' : 'No'],
+    ['Field Usage Included',     includeFieldUsage   ? 'Yes' : 'No'],
+    ['',                         ''],
+    ['Runtime',                  stats.runtimeFormatted],
+    ['Exported At',              new Date().toISOString()],
+    ['API Version',              session.apiVersion],
+    ['Org',                      session.instanceUrl?.replace('https://', '')],
+  ]
 }

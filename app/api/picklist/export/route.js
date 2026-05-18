@@ -1,93 +1,119 @@
 /**
  * POST /api/picklist/export
  *
- * Mirrors PicklistExporter.export_picklists_excel() from picklist_exporter.py.
- * Streams SSE progress while processing each object, then stores the completed
- * .xlsx in the job store and emits a done event with the download URL.
+ * Body: {
+ *   objects: string[],
+ *   exportMode?: 'single_tab' | 'multi_tab' | 'multi_file',
+ *   csvMode?: boolean,
+ * }
  *
- * Body: { objects: string[], exportMode?: 'single_tab'|'multi_tab' }
+ * Modes:
+ *   single_tab  — all objects in one sheet (excel) or one CSV file
+ *   multi_tab   — one tab per object in one Excel file (csv: ignored, same as single_tab)
+ *   multi_file  — one file per object, zipped together with a summary
  */
 
 import * as XLSX from 'xlsx-js-style'
+import JSZip from 'jszip'
 import { getSession } from '@/lib/session'
 import { SalesforceClient } from '@/lib/salesforce/client'
 import { createSSEStream } from '@/lib/streaming/sse'
 import { generateJobId, storeResult } from '@/lib/jobs/store'
-import { createStyledSheet, addSummarySheet, workbookToBuffer, newWorkbook, appendSheet, safeSheetName } from '@/lib/files/excel'
+import { addSummarySheet, workbookToBuffer, newWorkbook, appendSheet, safeSheetName, buildCsvBuffer } from '@/lib/files/excel'
 import { createPicklistStats } from '@/lib/models'
-import { formatRuntime, makeTimestamp, DEFAULT_PICKLIST_FILENAME } from '@/lib/config'
+import { formatRuntime, makeTimestamp } from '@/lib/config'
 
 const HEADERS = [
-  'Object',
-  'Field Label',
-  'Field API',
-  'Picklist Value Label',
-  'Picklist Value API',
-  'Status',
-  'IsGlobal?',
+  'Object', 'Field Label', 'Field API',
+  'Picklist Value Label', 'Picklist Value API', 'Status', 'IsGlobal?',
 ]
 
-/**
- * For each custom picklist field (name ending __c), fetch its Tooling API Metadata.
- * This is the ONLY way to get:
- *   1. Inactive picklist values  — describeSObject only returns active ones
- *   2. Global Value Set detection — valueSet.valueSetName present means global
- *
- * Key SF Tooling API constraint: Metadata field must be fetched ONE record at a time.
- * A batch IN-clause query with Metadata in the SELECT silently fails or errors.
- *
- * Returns Map<fieldApiName, { isGlobal: bool, allValues: [{label,value,active}]|null }>
- *   allValues is null for global fields (values come from the GlobalValueSet, not inline)
- *   — in that case caller falls back to describeSObject values (which ARE correct for globals).
- */
+// ─── Tooling API: fetch inactive values + global detection ───────────────────
+
 async function fetchCustomPicklistDetails(client, objectName, customPicklistFields) {
   const details = new Map()
-
   for (const field of customPicklistFields) {
     details.set(field.name, { isGlobal: false, allValues: null })
     try {
-      // Strip __c suffix to get DeveloperName
       const devName = field.name.replace(/__c$/i, '')
       const result  = await client.toolingQuery(
-        `SELECT Metadata FROM CustomField ` +
-        `WHERE DeveloperName = '${devName}' AND TableEnumOrId = '${objectName}'`
+        `SELECT Metadata FROM CustomField WHERE DeveloperName = '${devName}' AND TableEnumOrId = '${objectName}'`
       )
       const meta = result.records?.[0]?.Metadata
       if (!meta) continue
-
       const isGlobal = !!(meta.valueSet?.valueSetName)
       details.set(field.name, {
         isGlobal,
-        // For local value sets: extract all values including inactive
-        // For global value sets: allValues = null → caller uses describe values
         allValues: (!isGlobal && meta.valueSet?.valueSetDefinition?.value)
           ? meta.valueSet.valueSetDefinition.value.map(v => ({
-              label:  v.label || v.valueName,
-              value:  v.valueName,
-              active: v.isActive !== false,
+              label: v.label || v.valueName, value: v.valueName, active: v.isActive !== false,
             }))
           : null,
       })
-    } catch {
-      // Non-fatal: fall back to describe values, not marked global
-    }
+    } catch { /* non-fatal */ }
   }
-
   return details
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Sheet / CSV builders ────────────────────────────────────────────────────
+
+function buildPicklistSheet(titleLine, summaryLine, rows) {
+  const TITLE_FILL   = { patternType: 'solid', fgColor: { rgb: '0176D3' } }
+  const TITLE_FONT   = { bold: true, color: { rgb: 'FFFFFF' }, sz: 12 }
+  const SUMMARY_FILL = { patternType: 'solid', fgColor: { rgb: '1C4587' } }
+  const SUMMARY_FONT = { color: { rgb: 'FFFFFF' }, sz: 10 }
+  const HEADER_FILL  = { patternType: 'solid', fgColor: { rgb: '0176D3' } }
+  const HEADER_FONT  = { bold: true, color: { rgb: 'FFFFFF' }, sz: 11 }
+  const DATA_FONT    = { sz: 10 }
+  const DATA_ALIGN   = { vertical: 'top', wrapText: true }
+  const numCols      = HEADERS.length
+  const PAD          = ' '
+
+  const aoa = [
+    [titleLine,   ...Array(numCols - 1).fill(PAD)],
+    [summaryLine, ...Array(numCols - 1).fill(PAD)],
+    [...HEADERS],
+    ...rows,
+  ]
+  const ws = XLSX.utils.aoa_to_sheet(aoa)
+
+  ws['!merges'] = [
+    { s: { r: 0, c: 0 }, e: { r: 0, c: numCols - 1 } },
+    { s: { r: 1, c: 0 }, e: { r: 1, c: numCols - 1 } },
+  ]
+
+  for (let c = 0; c < numCols; c++) {
+    const a0 = XLSX.utils.encode_cell({ r: 0, c })
+    const a1 = XLSX.utils.encode_cell({ r: 1, c })
+    if (!ws[a0]) ws[a0] = { t: 's', v: PAD }
+    if (!ws[a1]) ws[a1] = { t: 's', v: PAD }
+    ws[a0].s = { fill: TITLE_FILL,   font: TITLE_FONT,   alignment: { horizontal: 'left', vertical: 'center' } }
+    ws[a1].s = { fill: SUMMARY_FILL, font: SUMMARY_FONT, alignment: { vertical: 'center' } }
+  }
+  HEADERS.forEach((_, c) => {
+    const addr = XLSX.utils.encode_cell({ r: 2, c })
+    if (ws[addr]) ws[addr].s = { fill: HEADER_FILL, font: HEADER_FONT, alignment: { horizontal: 'left', vertical: 'center' } }
+  })
+  rows.forEach((row, ri) => {
+    row.forEach((_, c) => {
+      const addr = XLSX.utils.encode_cell({ r: ri + 3, c })
+      if (ws[addr]) ws[addr].s = { font: DATA_FONT, alignment: DATA_ALIGN }
+    })
+  })
+  ws['!cols']   = HEADERS.map((h, i) => ({ wch: Math.min(Math.max(Math.max(String(h).length, ...rows.slice(0, 200).map(r => String(r[i] ?? '').length)) + 2, 8), 80) }))
+  ws['!freeze'] = { xSplit: 0, ySplit: 3, topLeftCell: 'A4', activePane: 'bottomLeft' }
+  ws['!rows']   = [{ hpt: 24 }, { hpt: 18 }, { hpt: 20 }, ...rows.map(() => ({ hpt: 15 }))]
+  return ws
+}
+
+// ─── Main route ──────────────────────────────────────────────────────────────
 
 export async function POST(request) {
-  const { objects = [], exportMode = 'single_tab' } = await request.json()
+  const { objects = [], exportMode = 'single_tab', csvMode = false } = await request.json()
 
   const session = await getSession()
-  if (!session.accessToken) {
-    return Response.json({ error: 'Not authenticated' }, { status: 401 })
-  }
-  if (!objects.length) {
-    return Response.json({ error: 'Select at least one object to export.' }, { status: 400 })
-  }
+  if (!session.accessToken) return Response.json({ error: 'Not authenticated' }, { status: 401 })
+  if (!objects.length)      return Response.json({ error: 'Select at least one object.' }, { status: 400 })
 
   const { response, emit, end } = createSSEStream()
 
@@ -97,168 +123,157 @@ export async function POST(request) {
       const jobId   = generateJobId()
       const startMs = Date.now()
       const stats   = createPicklistStats()
-      const usedSheetNames = new Set()
-
       stats.totalObjects = objects.length
 
-      const wb      = newWorkbook()
-      const allRows = [] // single_tab only
+      const modeLabel = csvMode
+        ? (exportMode === 'multi_file' ? 'CSV Multi-File' : 'CSV Single File')
+        : exportMode === 'multi_tab' ? 'Multi-Tab' : exportMode === 'multi_file' ? 'Multi-File ZIP' : 'Single Tab'
 
-      emit.info(`=== Picklist Export (${exportMode === 'multi_tab' ? 'Multi-Tab' : 'Single Tab'}) ===`)
+      emit.info(`=== Picklist Export (${modeLabel}) ===`)
       emit.info(`Objects to process: ${objects.length}`)
 
-      const sortedObjects = [...objects].sort()
+      // Containers
+      const wb          = newWorkbook()  // for single_tab / multi_tab Excel
+      const allRows     = []             // for single_tab
+      const usedNames   = new Set()
+      const zipFiles    = []             // [{ name, buffer }] for multi_file
 
-      for (let i = 0; i < sortedObjects.length; i++) {
-        const objName = sortedObjects[i]
-        const elapsed = (Date.now() - startMs) / 1000
-        const percent = Math.round((i / sortedObjects.length) * 88)
-
-        emit.progress(percent, `[${i + 1}/${sortedObjects.length}] Processing ${objName}…`, elapsed)
+      for (let i = 0; i < objects.length; i++) {
+        const objName  = objects[i]
+        const elapsed  = (Date.now() - startMs) / 1000
+        const pct      = Math.round((i / objects.length) * 88)
+        emit.progress(pct, `[${i + 1}/${objects.length}] Processing ${objName}…`, elapsed)
 
         try {
-          const describe = await client.describeSObject(objName)
+          const describe       = await client.describeSObject(objName)
+          const picklistFields = describe.fields.filter(f => f.type === 'picklist' || f.type === 'multipicklist')
 
-          const picklistFields = describe.fields.filter(f =>
-            f.type === 'picklist' || f.type === 'multipicklist'
-          )
-
-          if (picklistFields.length === 0) {
+          if (!picklistFields.length) {
             emit.warn(`  ⚠ ${objName}: no picklist fields — skipped`)
-            stats.objectsNoPicklists++
-            stats.successfulObjects++
+            stats.objectsNoPicklists++; stats.successfulObjects++
             continue
           }
 
-          // Fetch Tooling API metadata for custom fields only.
-          // This gives us inactive values + global detection in one step per field.
-          const customFields   = picklistFields.filter(f => f.name.endsWith('__c'))
-          const customDetails  = await fetchCustomPicklistDetails(client, objName, customFields)
-
+          const customFields  = picklistFields.filter(f => f.name.endsWith('__c'))
+          const customDetails = await fetchCustomPicklistDetails(client, objName, customFields)
           const objRows = []
-          let activeCount = 0, inactiveCount = 0, globalCount = 0
+          let active = 0, inactive = 0, global = 0
 
           for (const field of picklistFields) {
             const detail   = customDetails.get(field.name)
             const isGlobal = detail?.isGlobal ?? false
-            if (isGlobal) globalCount++
+            if (isGlobal) global++
 
-            // Prefer Tooling API values (includes inactive) for local custom fields.
-            // For standard fields and global custom fields, use describe values.
             const rawValues = detail?.allValues
-              ?? (field.picklistValues || []).map(v => ({
-                  label:  v.label,
-                  value:  v.value,
-                  active: v.active,
-                }))
+              ?? (field.picklistValues || []).map(v => ({ label: v.label, value: v.value, active: v.active }))
 
-            if (rawValues.length === 0) {
-              objRows.push([
-                objName, field.label, field.name,
-                '(no values)', '', '', isGlobal ? 'Yes' : '',
-              ])
+            if (!rawValues.length) {
+              objRows.push([objName, field.label, field.name, '(no values)', '', '', isGlobal ? 'Yes' : ''])
             } else {
               for (const v of rawValues) {
-                const isActive = v.active !== false  // default true if undefined
-                objRows.push([
-                  objName, field.label, field.name,
-                  v.label, v.value,
-                  isActive ? 'Active' : 'Inactive',
-                  isGlobal ? 'Yes' : '',
-                ])
-                isActive ? activeCount++ : inactiveCount++
+                const isActive = v.active !== false
+                objRows.push([objName, field.label, field.name, v.label, v.value, isActive ? 'Active' : 'Inactive', isGlobal ? 'Yes' : ''])
+                isActive ? active++ : inactive++
               }
             }
-
             stats.totalPicklistFields++
           }
 
-          if (exportMode === 'multi_tab') {
-            const ws = createPicklistSheet(objName, objRows)
-            appendSheet(wb, ws, safeSheetName(objName, usedSheetNames))
+          // --- Store per mode ---
+          if (exportMode === 'multi_tab' && !csvMode) {
+            const exportDate = new Date().toLocaleString('en-US', { hour12: false }).replace(',', '')
+            const ws = buildPicklistSheet(
+              'Salesforce Picklist Export',
+              `Object: ${objName} | Fields: ${picklistFields.length} | Values: ${active + inactive} | Export Date: ${exportDate}`,
+              objRows
+            )
+            appendSheet(wb, ws, safeSheetName(objName, usedNames))
+          } else if (exportMode === 'multi_file') {
+            if (csvMode) {
+              const buf = buildCsvBuffer(HEADERS, objRows)
+              zipFiles.push({ name: `${objName}_picklists.csv`, buffer: buf })
+            } else {
+              const exportDate = new Date().toLocaleString('en-US', { hour12: false }).replace(',', '')
+              const fileWb = newWorkbook()
+              const ws = buildPicklistSheet(
+                'Salesforce Picklist Export',
+                `Object: ${objName} | Fields: ${picklistFields.length} | Values: ${active + inactive} | Export Date: ${exportDate}`,
+                objRows
+              )
+              appendSheet(fileWb, ws, 'Picklist Data')
+              zipFiles.push({ name: `${objName}_picklists.xlsx`, buffer: workbookToBuffer(fileWb) })
+            }
           } else {
+            // single_tab (Excel or CSV)
             allRows.push(...objRows)
           }
 
-          const valueCount = activeCount + inactiveCount
-          stats.totalValues         += valueCount
-          stats.totalActiveValues   += activeCount
-          stats.totalInactiveValues += inactiveCount
-          stats.globalPicklistCount += globalCount
+          stats.totalValues         += active + inactive
+          stats.totalActiveValues   += active
+          stats.totalInactiveValues += inactive
+          stats.globalPicklistCount  = (stats.globalPicklistCount || 0) + global
           stats.successfulObjects++
-
-          emit.info(
-            `  ✓ ${objName}: ${picklistFields.length} field(s), ` +
-            `Active: ${activeCount}, Inactive: ${inactiveCount}` +
-            (globalCount ? `, Global: ${globalCount}` : '')
-          )
+          emit.info(`  ✓ ${objName}: ${picklistFields.length} field(s), Active: ${active}, Inactive: ${inactive}${global ? `, Global: ${global}` : ''}`)
 
         } catch (err) {
           if (err.code === 'SESSION_EXPIRED') throw err
           emit.error(`  ✗ ${objName}: ${err.message}`)
           stats.failedObjects++
-          stats.failedObjectDetails.push({ name: objName, reason: err.message })
+          stats.failedObjectDetails?.push({ name: objName, reason: err.message })
         }
       }
 
-      if (exportMode === 'single_tab') {
-        emit.progress(90, 'Building combined sheet…')
-        const exportDate = new Date().toLocaleString('en-US', { hour12: false })
-          .replace(',', '')
-        const ws = createPicklistSheet(
-          `Objects: ${stats.successfulObjects} | ` +
-          `Total Picklist Values: ${stats.totalValues} | ` +
-          `Global Picklists: ${stats.globalPicklistCount} | ` +
-          `Export Date: ${exportDate}`,
-          allRows
-        )
-        appendSheet(wb, ws, 'Picklist Data')
+      // --- Build final file ---
+      emit.progress(92, 'Building output…')
+      const elapsed      = (Date.now() - startMs) / 1000
+      stats.runtimeFormatted = formatRuntime(elapsed)
+      const timestamp    = makeTimestamp()
+
+      let finalBuffer, filename, contentType
+
+      if (exportMode === 'multi_file') {
+        // Add summary sheet/CSV to ZIP
+        const sumWb = newWorkbook()
+        addSummarySheet(sumWb, buildSummaryRows(stats, modeLabel, session), 'Summary')
+        zipFiles.push({ name: 'Summary.xlsx', buffer: workbookToBuffer(sumWb) })
+
+        emit.progress(95, 'Zipping files…')
+        const zip = new JSZip()
+        zipFiles.forEach(f => zip.file(f.name, f.buffer))
+        finalBuffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } })
+        filename    = `picklist_export_${timestamp}.zip`
+        contentType = 'application/zip'
+
+      } else if (csvMode) {
+        // single CSV
+        finalBuffer = buildCsvBuffer(HEADERS, allRows)
+        filename    = `picklist_export_${timestamp}.csv`
+        contentType = 'text/csv'
+
+      } else {
+        // single_tab or multi_tab Excel
+        if (exportMode === 'single_tab') {
+          const exportDate = new Date().toLocaleString('en-US', { hour12: false }).replace(',', '')
+          const ws = buildPicklistSheet(
+            'Salesforce Picklist Export',
+            `Objects: ${stats.successfulObjects} | Total Values: ${stats.totalValues} | Global: ${stats.globalPicklistCount || 0} | Export Date: ${exportDate}`,
+            allRows
+          )
+          appendSheet(wb, ws, 'Picklist Data')
+        }
+        addSummarySheet(wb, buildSummaryRows(stats, modeLabel, session), 'Summary')
+        finalBuffer = workbookToBuffer(wb)
+        filename    = `picklist_export_${timestamp}.xlsx`
+        contentType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
       }
 
-      const elapsed = (Date.now() - startMs) / 1000
-      stats.runtimeFormatted = formatRuntime(elapsed)
-
-      addSummarySheet(wb, [
-        ['Picklist Export Summary',  ''],
-        ['',                         ''],
-        ['Export Mode',              exportMode === 'multi_tab' ? 'Multi-Tab' : 'Single Tab'],
-        ['',                         ''],
-        ['Total Objects Selected',   String(stats.totalObjects)],
-        ['Successfully Processed',   String(stats.successfulObjects)],
-        ['Failed',                   String(stats.failedObjects)],
-        ['No Picklist Fields',       String(stats.objectsNoPicklists)],
-        ['',                         ''],
-        ['Total Picklist Fields',    String(stats.totalPicklistFields)],
-        ['  incl. Global Picklists', String(stats.globalPicklistCount)],
-        ['',                         ''],
-        ['Total Values',             String(stats.totalValues)],
-        ['  Active',                 String(stats.totalActiveValues)],
-        ['  Inactive',               String(stats.totalInactiveValues)],
-        ['',                         ''],
-        ['Runtime',                  stats.runtimeFormatted],
-        ['Exported At',              new Date().toISOString()],
-        ['API Version',              session.apiVersion],
-        ['Org',                      session.instanceUrl?.replace('https://', '')],
-      ], 'Summary')
-
-      emit.progress(96, 'Generating Excel file…', elapsed)
-
-      const buffer = workbookToBuffer(wb)
-      storeResult(jobId, {
-        buffer,
-        filename:    DEFAULT_PICKLIST_FILENAME.replace('{timestamp}', makeTimestamp()),
-        contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-      })
-
+      storeResult(jobId, { buffer: finalBuffer, filename, contentType })
       emit.done(`/api/picklist/download/${jobId}`, stats)
       emit.success(`=== Export complete in ${stats.runtimeFormatted} ===`)
 
     } catch (err) {
-      if (err.code === 'SESSION_EXPIRED') {
-        emit.error('Session expired. Please reconnect to Salesforce.')
-      } else {
-        emit.error(`Export failed: ${err.message}`)
-      }
+      if (err.code === 'SESSION_EXPIRED') emit.error('Session expired. Please reconnect.')
+      else emit.error(`Export failed: ${err.message}`)
     } finally {
       end()
     }
@@ -267,98 +282,26 @@ export async function POST(request) {
   return response
 }
 
-// ─── Sheet builder matching Python format ─────────────────────────────────────
-
-/**
- * Creates the picklist data sheet with the Python-style title header rows.
- * Row 1: "Salesforce Picklist Export" (bold, merged-look title)
- * Row 2: summary string (e.g. "Objects: 1 | Total Picklist Values: 51 | …")
- * Row 3: column headers (blue, bold)
- * Row 4+: data rows
- */
-function createPicklistSheet(summaryLine, rows) {
-  const TITLE_FILL   = { patternType: 'solid', fgColor: { rgb: '0176D3' } }
-  const TITLE_FONT   = { bold: true, color: { rgb: 'FFFFFF' }, sz: 12 }
-  const HEADER_FILL  = { patternType: 'solid', fgColor: { rgb: '0176D3' } }
-  const HEADER_FONT  = { bold: true, color: { rgb: 'FFFFFF' }, sz: 11 }
-  const SUMMARY_FILL = { patternType: 'solid', fgColor: { rgb: '1C4587' } }
-  const SUMMARY_FONT = { color: { rgb: 'FFFFFF' }, sz: 10 }
-  const DATA_FONT    = { sz: 10 }
-  const DATA_ALIGN   = { vertical: 'top', wrapText: true }
-
-  const numCols = HEADERS.length
-
-  // Use ' ' (space) not '' for empty merged cells.
-  // SheetJS silently skips cells where v==='' when writing the XLSX binary,
-  // so the fill style never reaches the file. A space forces a real cell object.
-  const PAD = ' '
-  const aoa = [
-    ['Salesforce Picklist Export', ...Array(numCols - 1).fill(PAD)],
-    [summaryLine,                  ...Array(numCols - 1).fill(PAD)],
-    [...HEADERS],
-    ...rows,
+function buildSummaryRows(stats, modeLabel, session) {
+  return [
+    ['Picklist Export Summary', ''],
+    ['', ''],
+    ['Export Mode',             modeLabel],
+    ['', ''],
+    ['Total Objects Selected',  String(stats.totalObjects)],
+    ['Successfully Processed',  String(stats.successfulObjects)],
+    ['Failed',                  String(stats.failedObjects)],
+    ['No Picklist Fields',      String(stats.objectsNoPicklists)],
+    ['', ''],
+    ['Total Picklist Fields',   String(stats.totalPicklistFields)],
+    ['  incl. Global',          String(stats.globalPicklistCount || 0)],
+    ['', ''],
+    ['Total Values',            String(stats.totalValues)],
+    ['  Active',                String(stats.totalActiveValues)],
+    ['  Inactive',              String(stats.totalInactiveValues)],
+    ['', ''],
+    ['Runtime',                 stats.runtimeFormatted],
+    ['Exported At',             new Date().toISOString()],
+    ['Org',                     session.instanceUrl?.replace('https://', '')],
   ]
-
-  const ws = XLSX.utils.aoa_to_sheet(aoa)
-
-  // Merge title and summary rows across all columns so text isn't cut off.
-  // xlsx-js-style correctly propagates fill through merged ranges.
-  ws['!merges'] = [
-    { s: { r: 0, c: 0 }, e: { r: 0, c: numCols - 1 } },
-    { s: { r: 1, c: 0 }, e: { r: 1, c: numCols - 1 } },
-  ]
-
-  // Title row (row 0)
-  for (let c = 0; c < numCols; c++) {
-    const addr = XLSX.utils.encode_cell({ r: 0, c })
-    if (!ws[addr]) ws[addr] = { t: 's', v: ' ' }
-    ws[addr].s = { fill: TITLE_FILL, font: TITLE_FONT, alignment: { horizontal: 'left', vertical: 'center' } }
-  }
-
-  // Summary row (row 1)
-  for (let c = 0; c < numCols; c++) {
-    const addr = XLSX.utils.encode_cell({ r: 1, c })
-    if (!ws[addr]) ws[addr] = { t: 's', v: ' ' }
-    ws[addr].s = { fill: SUMMARY_FILL, font: SUMMARY_FONT, alignment: { vertical: 'center' } }
-  }
-
-  // Style header row (row 2)
-  HEADERS.forEach((_, c) => {
-    const addr = XLSX.utils.encode_cell({ r: 2, c })
-    if (ws[addr]) ws[addr].s = {
-      fill:      HEADER_FILL,
-      font:      HEADER_FONT,
-      alignment: { horizontal: 'left', vertical: 'center' },
-      border:    { top: { style: 'thin', color: { rgb: 'FFFFFF' } }, bottom: { style: 'thin', color: { rgb: 'FFFFFF' } } },
-    }
-  })
-
-  // Style data rows (row 3+)
-  rows.forEach((row, ri) => {
-    row.forEach((_, c) => {
-      const addr = XLSX.utils.encode_cell({ r: ri + 3, c })
-      if (ws[addr]) ws[addr].s = { font: DATA_FONT, alignment: DATA_ALIGN }
-    })
-  })
-
-  // Column widths
-  ws['!cols'] = HEADERS.map((h, i) => {
-    const maxLen = Math.max(
-      String(h).length,
-      ...rows.slice(0, 500).map(r => String(r[i] ?? '').length)
-    )
-    return { wch: Math.min(Math.max(maxLen + 2, 8), 80) }
-  })
-
-  // Freeze at row 3 (below title + summary + header)
-  ws['!freeze'] = { xSplit: 0, ySplit: 3, topLeftCell: 'A4', activePane: 'bottomLeft' }
-
-  ws['!rows'] = [
-    { hpt: 24 },  // title
-    { hpt: 18 },  // summary
-    { hpt: 20 },  // headers
-    ...rows.map(() => ({ hpt: 15 })),
-  ]
-
-  return ws
 }

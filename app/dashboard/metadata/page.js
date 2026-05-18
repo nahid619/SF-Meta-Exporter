@@ -10,6 +10,8 @@ import { useExport }  from '@/hooks/useExport'
 
 export default function MetadataExporterPage() {
   const [selected,            setSelected]            = useState([])
+  const [exportMode,          setExportMode]          = useState('multi_tab')
+  const [csvMode,             setCsvMode]             = useState(false)
   const [includeDescriptions, setIncludeDescriptions] = useState(true)
   const [includeFieldUsage,   setIncludeFieldUsage]   = useState(false)
 
@@ -17,7 +19,7 @@ export default function MetadataExporterPage() {
 
   function handleExport() {
     if (!selected.length) return
-    startExport('/api/metadata/export', { objects: selected, includeDescriptions, includeFieldUsage })
+    startExport('/api/metadata/export', { objects: selected, includeDescriptions, includeFieldUsage, exportMode, csvMode })
   }
 
   const hasActivity = isRunning || progress || downloadUrl || error
@@ -156,23 +158,63 @@ export default function MetadataExporterPage() {
           width: '20%', display: 'flex', flexDirection: 'column', minHeight: 0,
           borderRight: '1px solid var(--border)',
         }}>
-          <div style={{
-            flexShrink: 0, padding: '12px 16px', borderBottom: '1px solid var(--border)',
-            background: 'var(--bg-card)',
-            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-          }}>
-            <span style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--text-3)' }}>
-              Selected for Export
-            </span>
-            {selected.length > 0 && (
-              <span style={{
-                background: 'var(--accent-dim)', border: '1px solid rgba(56,139,253,0.3)',
-                borderRadius: '20px', padding: '2px 10px',
-                fontSize: '11px', color: 'var(--accent-hi)',
-              }}>
-                {selected.length} {selected.length === 1 ? 'object' : 'objects'}
+          <div style={{ flexShrink: 0, background: 'var(--bg-card)', borderBottom: '1px solid var(--border)' }}>
+
+            {/* Selected count row */}
+            <div style={{ padding: '10px 16px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '1px solid var(--border)' }}>
+              <span style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--text-3)' }}>
+                Selected for Export
               </span>
-            )}
+              {selected.length > 0 && (
+                <span style={{ background: 'var(--accent-dim)', border: '1px solid rgba(56,139,253,0.3)', borderRadius: '20px', padding: '2px 10px', fontSize: '11px', color: 'var(--accent-hi)' }}>
+                  {selected.length} {selected.length === 1 ? 'object' : 'objects'}
+                </span>
+              )}
+            </div>
+
+            {/* Export Format + CSV toggle */}
+            <div style={{ padding: '10px 14px' }}>
+              <div style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--text-3)', marginBottom: '7px' }}>
+                Export Format
+              </div>
+              <div style={{ display: 'flex', gap: '4px', marginBottom: '7px' }}>
+                {[
+                  { value: 'multi_tab',  label: 'Multi-Tab',  sub: 'Tabs per object', disabledWhenCsv: true },
+                  { value: 'multi_file', label: 'Multi-File', sub: 'ZIP per object' },
+                ].map(opt => {
+                  const isDisabled = isRunning || (csvMode && opt.disabledWhenCsv)
+                  return (
+                    <button
+                      key={opt.value} type="button"
+                      className={`seg-btn ${exportMode === opt.value && !isDisabled ? 'active' : ''}`}
+                      onClick={() => { if (!isDisabled) setExportMode(opt.value) }}
+                      disabled={isDisabled}
+                      title={csvMode && opt.disabledWhenCsv ? 'Not available in CSV mode' : ''}
+                      style={{ flex: 1, flexDirection: 'column', gap: '1px', paddingTop: '6px', paddingBottom: '6px', opacity: isDisabled ? 0.35 : 1 }}
+                    >
+                      <span style={{ fontWeight: 600, fontSize: '11px' }}>{opt.label}</span>
+                      <span style={{ fontSize: '9.5px', opacity: 0.75 }}>{opt.sub}</span>
+                    </button>
+                  )
+                })}
+              </div>
+              <label style={{
+                display: 'flex', alignItems: 'center', gap: '7px', padding: '6px 8px',
+                background: csvMode ? 'rgba(56,139,253,0.08)' : 'var(--bg-input)',
+                border: `1px solid ${csvMode ? 'var(--accent)' : 'var(--border-hi)'}`,
+                borderRadius: 'var(--radius-sm)', cursor: isRunning ? 'not-allowed' : 'pointer',
+                transition: 'all 0.15s',
+              }}>
+                <input type="checkbox" checked={csvMode} onChange={e => {
+                  setCsvMode(e.target.checked)
+                  if (e.target.checked && exportMode === 'multi_tab') setExportMode('multi_file')
+                }} disabled={isRunning} style={{ accentColor: 'var(--accent)', flexShrink: 0 }} />
+                <div>
+                  <div style={{ fontSize: '11.5px', color: csvMode ? '#bfdbfe' : '#c9d1d9', fontWeight: 500 }}>CSV Mode</div>
+                  <div style={{ fontSize: '10px', color: '#8b949e' }}>.csv output · Multi-Tab disabled</div>
+                </div>
+              </label>
+            </div>
           </div>
 
           <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '10px 12px' }}>
@@ -281,7 +323,16 @@ export default function MetadataExporterPage() {
                 </div>
                 <ProgressBar progress={progress} isRunning={false} />
                 <StatsSummary stats={stats} title="Metadata Export Summary" />
-                <DownloadButton url={downloadUrl} label="Download Excel File (.xlsx)" />
+                <DownloadButton
+                  url={downloadUrl}
+                  label={
+                    exportMode === 'multi_file'
+                      ? `Download ZIP Archive (${csvMode ? 'CSV files' : 'Excel files'})`
+                      : csvMode
+                        ? 'Download CSV File'
+                        : 'Download Excel File (.xlsx)'
+                  }
+                />
               </>
             )}
           </div>

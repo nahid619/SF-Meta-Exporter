@@ -26,6 +26,7 @@ export default function ObjectSelector({
   disabled  = false,
   maxHeight = '320px',
   fillHeight = false,
+  extraNode = null,   // optional node rendered at the end of the filter chip row
 }) {
   const [objects, setObjects] = useState([])
   const [loading, setLoading] = useState(true)
@@ -85,7 +86,7 @@ export default function ObjectSelector({
             onChange={e => setSearch(e.target.value)}
             disabled={loading || disabled}
           />
-          <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center' }}>
             {[
               { label: '⭐ Common Objects', action: selectCommon },
               { label: `✓ All Visible (${filtered.length})`, action: selectAll },
@@ -104,6 +105,7 @@ export default function ObjectSelector({
                 }}
               >{btn.label}</button>
             ))}
+            {extraNode && <div style={{ marginLeft: 'auto' }}>{extraNode}</div>}
           </div>
         </div>
 
