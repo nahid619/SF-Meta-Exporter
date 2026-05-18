@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { getSession } from '@/lib/session'
 import { SalesforceClient } from '@/lib/salesforce/client'
+import { checkRateLimit, rateLimitResponse, QUERY_LIMIT } from '@/lib/rateLimit'
 
 export const dynamic = 'force-dynamic'
 
@@ -15,10 +16,13 @@ export const dynamic = 'force-dynamic'
  */
 export async function GET() {
   const session = await getSession()
-
+  
   if (!session.accessToken) {
     return NextResponse.json({ error: 'Not authenticated' }, { status: 401 })
   }
+
+  const rl = checkRateLimit(`${session.instanceUrl}:objects`, QUERY_LIMIT)
+  if (!rl.allowed) return rateLimitResponse(rl.resetAt)
 
   try {
     const client  = SalesforceClient.fromSession(session)

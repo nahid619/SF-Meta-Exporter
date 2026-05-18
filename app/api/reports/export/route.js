@@ -24,6 +24,7 @@ import { SalesforceClient } from '@/lib/salesforce/client'
 import { createSSEStream } from '@/lib/streaming/sse'
 import { generateJobId, storeResult } from '@/lib/jobs/store'
 import { formatRuntime, makeTimestamp } from '@/lib/config'
+import { checkRateLimit, rateLimitResponse, EXPORT_LIMIT } from '@/lib/rateLimit'
 
 const EXCEL_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 const EXCEL_ACCEPT       = EXCEL_CONTENT_TYPE
@@ -136,6 +137,10 @@ export async function POST(request) {
   if (!session.accessToken) {
     return Response.json({ error: 'Not authenticated' }, { status: 401 })
   }
+
+  const rl = checkRateLimit(`${session.instanceUrl}:reports`, EXPORT_LIMIT)
+  if (!rl.allowed) return rateLimitResponse(rl.resetAt)
+
   if (!reportIds.length) {
     return Response.json({ error: 'Select at least one report to export.' }, { status: 400 })
   }

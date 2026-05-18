@@ -21,6 +21,7 @@ import { createStyledSheet, addSummarySheet, workbookToBuffer, newWorkbook, appe
 import { createMetadataStats } from '@/lib/models'
 import { buildObjectUsageCache, getFieldUsageString } from '@/lib/salesforce/fieldUsage'
 import { formatRuntime, makeTimestamp, DEFAULT_METADATA_FILENAME } from '@/lib/config'
+import { checkRateLimit, rateLimitResponse, EXPORT_LIMIT } from '@/lib/rateLimit'
 
 // ── Exact 15 column headers from models.py MetadataField ─────────────────────
 const HEADERS = [
@@ -147,6 +148,10 @@ export async function POST(request) {
   if (!session.accessToken) {
     return Response.json({ error: 'Not authenticated' }, { status: 401 })
   }
+
+  const rl = checkRateLimit(`${session.instanceUrl}:metadata`, EXPORT_LIMIT)
+  if (!rl.allowed) return rateLimitResponse(rl.resetAt)
+
   if (!objects.length) {
     return Response.json({ error: 'Select at least one object.' }, { status: 400 })
   }

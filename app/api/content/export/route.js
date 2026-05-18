@@ -24,6 +24,7 @@ import { generateJobId, storeResult } from '@/lib/jobs/store'
 import { rowsToCSV } from '@/lib/files/csv'
 import { createContentDocStats } from '@/lib/models'
 import { formatRuntime, makeTimestamp } from '@/lib/config'
+import { checkRateLimit, rateLimitResponse, EXPORT_LIMIT } from '@/lib/rateLimit'
 
 // ── Filename helpers ──────────────────────────────────────────────────────────
 
@@ -205,6 +206,9 @@ export async function POST(request) {
   if (!session.accessToken) {
     return Response.json({ error: 'Not authenticated' }, { status: 401 })
   }
+
+  const rl = checkRateLimit(`${session.instanceUrl}:content`, EXPORT_LIMIT)
+  if (!rl.allowed) return rateLimitResponse(rl.resetAt)
 
   const { response, emit, end } = createSSEStream()
 

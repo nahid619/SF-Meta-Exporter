@@ -39,7 +39,7 @@ export default function Sidebar({ session }) {
     <>
       {/* Header */}
       <div className="sidebar-header">
-        <div className="sidebar-logo">
+        <div className="sidebar-logo" onClick={() => navigate('/dashboard')} style={{ cursor: 'pointer' }}>
           <div className="sidebar-logo-icon">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="white" aria-hidden>
               <path d="M19 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2Zm-7 14-5-5 1.4-1.4L12 14.2l7.6-7.6L21 8l-9 9Z"/>

@@ -28,6 +28,7 @@ import {
   deployFlow,
   deployTrigger,
 } from '@/lib/salesforce/switch/index'
+import { checkRateLimit, rateLimitResponse, EXPORT_LIMIT } from '@/lib/rateLimit'
 
 const DEPLOYERS = {
   ValidationRule: deployValidationRule,
@@ -43,6 +44,10 @@ export async function POST(request) {
   if (!session.accessToken) {
     return Response.json({ error: 'Not authenticated' }, { status: 401 })
   }
+
+  const rl = checkRateLimit(`${session.instanceUrl}:deploy`, EXPORT_LIMIT)
+  if (!rl.allowed) return rateLimitResponse(rl.resetAt)
+
   if (!changes.length) {
     return Response.json({ error: 'No changes to deploy' }, { status: 400 })
   }

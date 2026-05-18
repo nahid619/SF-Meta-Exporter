@@ -22,6 +22,7 @@ import { generateJobId, storeResult } from '@/lib/jobs/store'
 import { addSummarySheet, workbookToBuffer, newWorkbook, appendSheet, safeSheetName, buildCsvBuffer } from '@/lib/files/excel'
 import { createPicklistStats } from '@/lib/models'
 import { formatRuntime, makeTimestamp } from '@/lib/config'
+import { checkRateLimit, rateLimitResponse, EXPORT_LIMIT } from '@/lib/rateLimit'
 
 const HEADERS = [
   'Object', 'Field Label', 'Field API',
@@ -113,6 +114,10 @@ export async function POST(request) {
 
   const session = await getSession()
   if (!session.accessToken) return Response.json({ error: 'Not authenticated' }, { status: 401 })
+
+  const rl = checkRateLimit(`${session.instanceUrl}:picklist`, EXPORT_LIMIT)
+  if (!rl.allowed) return rateLimitResponse(rl.resetAt)
+
   if (!objects.length)      return Response.json({ error: 'Select at least one object.' }, { status: 400 })
 
   const { response, emit, end } = createSSEStream()

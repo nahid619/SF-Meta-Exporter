@@ -17,6 +17,7 @@
 import { getSession } from '@/lib/session'
 import { SalesforceClient } from '@/lib/salesforce/client'
 import { createSSEStream } from '@/lib/streaming/sse'
+import { checkRateLimit, rateLimitResponse, QUERY_LIMIT } from '@/lib/rateLimit'
 import {
   loadValidationRules,
   loadWorkflowRules,
@@ -36,6 +37,9 @@ export async function POST() {
   if (!session.accessToken) {
     return Response.json({ error: 'Not authenticated' }, { status: 401 })
   }
+
+  const rl = checkRateLimit(`${session.instanceUrl}:switch-load`, QUERY_LIMIT)
+  if (!rl.allowed) return rateLimitResponse(rl.resetAt)
 
   const { response, emit, end } = createSSEStream()
 

@@ -13,6 +13,7 @@
 
 import { getSession } from '@/lib/session'
 import { SalesforceClient } from '@/lib/salesforce/client'
+import { checkRateLimit, rateLimitResponse, QUERY_LIMIT } from '@/lib/rateLimit'
 
 // Basic security: reject patterns that have no place in SOQL
 const DANGEROUS = [/;/, /--/, /\/\*/, /\*\//, /\bEXECUTE?\b/i]
@@ -75,6 +76,9 @@ export async function POST(request) {
   if (!session.accessToken) {
     return Response.json({ error: 'Not authenticated — please reconnect', records: [], totalSize: 0, count: 0 }, { status: 401 })
   }
+
+  const rl = checkRateLimit(`${session.instanceUrl}:soql-execute`, QUERY_LIMIT)
+  if (!rl.allowed) return rateLimitResponse(rl.resetAt)
 
   const startMs = Date.now()
 
