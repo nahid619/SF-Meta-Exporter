@@ -312,9 +312,8 @@ export default function SetupGuide({ onClose }) {
             <p>Still in OAuth Settings, click <strong>Add</strong> to add these scopes:</p>
             <div style={{ marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
               {[
-                { scope: 'api',           label: 'Access and manage your data (api)',                             required: true  },
                 { scope: 'refresh_token', label: 'Perform requests at any time (refresh_token, offline_access)', required: true  },
-                { scope: 'full',          label: 'Full access (full)',                                            required: false, note: 'Recommended — needed for Metadata API operations' },
+                { scope: 'full',          label: 'Full access (full)',                                            required: true, note: 'Recommended — needed for Metadata API operations' },
               ].map(({ scope, label, required, note }) => (
                 <div key={scope} style={{
                   display: 'flex', alignItems: 'flex-start', gap: '10px',
@@ -353,7 +352,8 @@ export default function SetupGuide({ onClose }) {
               <div style={{ padding: '10px 12px', background: 'var(--bg-input)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
                 <div style={{ fontWeight: 600, color: 'var(--text-1)', marginBottom: '6px' }}>Security</div>
                 <div style={{ color: 'var(--text-2)' }}>✅ Check &nbsp;<strong>"Require Proof Key for Code Exchange (PKCE)"</strong></div>
-                <div style={{ color: 'var(--text-2)', marginTop: '5px' }}>✅ Uncheck <strong>"Require secret for Web Server Flow"</strong>&nbsp; (no secret needed with PKCE)</div>
+                <div style={{ color: 'var(--text-2)', marginTop: '5px' }}>❌ Uncheck <strong>"Require secret for Web Server Flow"</strong>&nbsp; (no secret needed with PKCE)</div>
+                <div style={{ color: 'var(--text-2)', marginTop: '5px' }}>❌ Uncheck <strong>"all options except the first one. </strong></div>
               </div>
             </div>
           </Step>
