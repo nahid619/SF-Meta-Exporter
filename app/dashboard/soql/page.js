@@ -376,7 +376,7 @@ const DEFAULT_QUERY = 'SELECT Id, Name\nFROM Account\nLIMIT 10'
 
 export default function SOQLRunnerPage() {
   const [query,       setQuery]       = useState(DEFAULT_QUERY)
-  const [result,      setResult]      = useState(null)   // { records, totalSize, count, elapsed, error }
+  const [result,      setResult]      = useState(null)   // { records, totalSize, count, elapsed, error, apiUsage }
   const [isLoading,   setIsLoading]   = useState(false)
   const [showSamples, setShowSamples] = useState(false)
   const [showHistory, setShowHistory] = useState(false)
@@ -645,6 +645,11 @@ export default function SOQLRunnerPage() {
                 {result.count.toLocaleString()}
                 {result.totalSize > result.count && ` of ${result.totalSize.toLocaleString()}`}
                 {' '}record{result.count !== 1 ? 's' : ''} · {result.elapsed}
+                {result.apiUsage && (
+                  <span style={{ color: result.apiUsage.remaining < 1000 ? 'var(--amber)' : 'var(--text-2)', marginLeft: '8px' }}>
+                    · API {result.apiUsage.used.toLocaleString()}/{result.apiUsage.total.toLocaleString()} used
+                  </span>
+                )}
                 {result.count > MAX_DISPLAY_ROWS && (
                   <span style={{ color: 'var(--amber)', marginLeft: '8px' }}>
                     (showing first {MAX_DISPLAY_ROWS.toLocaleString()})

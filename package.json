@@ -18,6 +18,7 @@
     "next": "^15.3.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
+    "//": "xlsx is pinned to 0.18.5 — v0.19+ switched to a commercial license (SheetJS Pro). Do not bump.",
     "xlsx": "0.18.5",
     "xlsx-js-style": "^1.2.0"
   },

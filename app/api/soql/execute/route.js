@@ -79,10 +79,10 @@ export async function POST(request) {
   const startMs = Date.now()
 
   try {
-    const client            = SalesforceClient.fromSession(session)
+    const client                 = SalesforceClient.fromSession(session)
     const { records, totalSize } = await client.queryAll(query)
-    const cleaned           = cleanRecords(records)
-    const elapsed           = ((Date.now() - startMs) / 1000).toFixed(2)
+    const cleaned                = cleanRecords(records)
+    const elapsed                = ((Date.now() - startMs) / 1000).toFixed(2)
 
     return Response.json({
       records:   cleaned,
@@ -90,6 +90,7 @@ export async function POST(request) {
       count:     cleaned.length,
       elapsed:   `${elapsed}s`,
       error:     null,
+      apiUsage:  client.apiUsage ?? null,   // { used, total, remaining } — null if SF omitted the header
     })
   } catch (err) {
     // Surface Salesforce error messages directly — mirrors Python behaviour
