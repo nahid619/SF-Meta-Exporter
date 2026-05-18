@@ -2,6 +2,9 @@
   "name": "sfmeta-web",
   "version": "1.0.0",
   "private": true,
+  "_comments": {
+    "xlsx": "Pinned to 0.18.5 — v0.19+ switched to a commercial license (SheetJS Pro). Do not bump."
+  },
   "engines": {
     "node": ">=18.18.0"
   },
@@ -18,7 +21,6 @@
     "next": "^15.3.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "//": "xlsx is pinned to 0.18.5 — v0.19+ switched to a commercial license (SheetJS Pro). Do not bump.",
     "xlsx": "0.18.5",
     "xlsx-js-style": "^1.2.0"
   },
