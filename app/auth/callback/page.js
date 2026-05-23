@@ -1,3 +1,4 @@
+// app/auth/callback/page.js
 'use client'
 
 import { useEffect, useState } from 'react'
@@ -8,8 +9,16 @@ import { useEffect, useState } from 'react'
  * parent window and closes itself.
  *
  * Mirrors the _CallbackHandler in oauth_handler.py — same three states:
- * processing → success → (close) or error.
+ * processing → success → (close) or error → (close).
+ *
+ * IMPORTANT: the error branches also auto-close after a delay. Leaving the
+ * popup open caused retries to re-use the stale window (named-target reuse),
+ * which combined with Salesforce's SSO cookie made it look like the second
+ * attempt failed without ever showing a login form.
  */
+const ERROR_CLOSE_DELAY_MS   = 2500
+const SUCCESS_CLOSE_DELAY_MS = 1400
+
 export default function CallbackPage() {
   const [status,  setStatus]  = useState('processing') // 'processing' | 'success' | 'error'
   const [message, setMessage] = useState('Completing login…')
@@ -23,17 +32,12 @@ export default function CallbackPage() {
     // Salesforce returned an error on the redirect
     if (sfError) {
       const msg = sfErrorDesc || sfError
-      setStatus('error')
-      setMessage(msg)
-      notifyParent(`LOGIN_ERROR:${msg}`)
+      failWith(msg)
       return
     }
 
     if (!code) {
-      const msg = 'No authorization code in callback URL.'
-      setStatus('error')
-      setMessage(msg)
-      notifyParent(`LOGIN_ERROR:${msg}`)
+      failWith('No authorization code in callback URL.')
       return
     }
 
@@ -46,23 +50,29 @@ export default function CallbackPage() {
       .then(r => r.json())
       .then(data => {
         if (data.error) {
-          setStatus('error')
-          setMessage(data.error)
-          notifyParent(`LOGIN_ERROR:${data.error}`)
+          failWith(data.error)
         } else {
           setStatus('success')
           setMessage(`Connected to ${data.instanceUrl || 'Salesforce'}`)
           notifyParent('LOGIN_SUCCESS')
           // Close popup after a short delay so user sees the success screen
-          setTimeout(() => window.close(), 1400)
+          setTimeout(() => window.close(), SUCCESS_CLOSE_DELAY_MS)
         }
       })
       .catch(err => {
         const msg = err.message || 'Unknown error during token exchange.'
-        setStatus('error')
-        setMessage(msg)
-        notifyParent(`LOGIN_ERROR:${msg}`)
+        failWith(msg)
       })
+
+    function failWith(msg) {
+      setStatus('error')
+      setMessage(msg)
+      notifyParent(`LOGIN_ERROR:${msg}`)
+      // Auto-close on error too — prevents the next login attempt from
+      // re-using a stale popup. The user already sees the error on the
+      // parent page, so they don't need this window lingering.
+      setTimeout(() => { try { window.close() } catch {} }, ERROR_CLOSE_DELAY_MS)
+    }
   }, [])
 
   function notifyParent(msg) {
@@ -82,7 +92,7 @@ export default function CallbackPage() {
   const subtexts = {
     processing: 'Exchanging credentials with Salesforce.',
     success:    'This window will close automatically.',
-    error:      'Close this window and try again.',
+    error:      'This window will close automatically. You can retry from the main page.',
   }
 
   return (
@@ -109,7 +119,7 @@ export default function CallbackPage() {
               fontFamily: 'var(--font-outfit)',
             }}
           >
-            Close Window
+            Close Now
           </button>
         )}
       </div>
