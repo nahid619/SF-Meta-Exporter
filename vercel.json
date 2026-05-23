@@ -1,18 +1,43 @@
 {
   "functions": {
-    "app/api/switch/deploy/route.js":   { "maxDuration": 300 },
-    "app/api/reports/export/route.js":  { "maxDuration": 300 },
-    "app/api/content/export/route.js":  { "maxDuration": 60  },
-    "app/api/metadata/export/route.js": { "maxDuration": 60  },
-    "app/api/picklist/export/route.js": { "maxDuration": 60  }
+    "app/api/switch/deploy/route.js": {
+      "maxDuration": 300
+    },
+    "app/api/reports/export/route.js": {
+      "maxDuration": 300
+    },
+    "app/api/content/export/route.js": {
+      "maxDuration": 60
+    },
+    "app/api/metadata/export/route.js": {
+      "maxDuration": 60
+    },
+    "app/api/picklist/export/route.js": {
+      "maxDuration": 60
+    },
+    "app/api/backup/export/route.js": {
+      "maxDuration": 300
+    },
+    "app/api/backup/restore/route.js": {
+      "maxDuration": 300
+    }
   },
   "headers": [
     {
       "source": "/api/(.*)",
       "headers": [
-        { "key": "X-Content-Type-Options", "value": "nosniff"       },
-        { "key": "X-Frame-Options",        "value": "DENY"          },
-        { "key": "X-XSS-Protection",       "value": "1; mode=block" }
+        {
+          "key": "X-Content-Type-Options",
+          "value": "nosniff"
+        },
+        {
+          "key": "X-Frame-Options",
+          "value": "DENY"
+        },
+        {
+          "key": "X-XSS-Protection",
+          "value": "1; mode=block"
+        }
       ]
     }
   ]

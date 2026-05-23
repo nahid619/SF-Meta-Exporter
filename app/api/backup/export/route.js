@@ -68,7 +68,9 @@ export async function POST(request) {
           // NOTE: f.queryable does NOT exist at the field level — it is an
           // SObject-level property only. The correct check is to exclude
           // compound types and deprecated/hidden fields.
-          const COMPOUND_TYPES = new Set(['address', 'location'])
+          // base64 fields (Attachment.Body, ContentVersion.VersionData, etc.) are
+          // large binary blobs that inflate the ZIP and break the restore body limit.
+          const COMPOUND_TYPES = new Set(['address', 'location', 'base64'])
           const queryableFields = describe.fields
             .filter(f => !f.deprecatedAndHidden && !COMPOUND_TYPES.has(f.type))
             .map(f => f.name)
