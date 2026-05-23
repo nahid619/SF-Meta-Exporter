@@ -1,6 +1,16 @@
 // app/api/backup/restore/route.js
 
 /**
+ * Increase the body size limit for this route — the restore POST sends all
+ * CSV data as JSON, which can exceed Next.js's default 4 MB cap.
+ * Note: on Vercel, the platform limit (4.5 MB hobby / higher on Pro) also applies.
+ * For very large orgs, consider a streaming multipart upload instead.
+ */
+export const config = {
+  api: { bodyParser: { sizeLimit: '50mb' } },
+}
+
+/**
  * POST /api/backup/restore
  *
  * Body: {
@@ -204,6 +214,18 @@ export async function POST(request) {
       emit.info(`Target org: ${session.instanceUrl?.replace('https://', '')}`)
       emit.info(`Import order: ${sortedObjects.join(' → ')}`)
 
+      // ── ID remap table ────────────────────────────────────────────────────
+      // Salesforce always generates new IDs on insert — the original IDs from
+      // the backup are thrown away. Without remapping, every lookup/reference
+      // field on child objects (e.g. Contact.AccountId) would point to an ID
+      // that no longer exists, even on the same org.
+      //
+      // As we insert each object we capture oldId → newId here, then for every
+      // subsequent object we rewrite reference field values before inserting.
+      // Salesforce IDs are globally unique (different key prefix per object),
+      // so a single flat Map across all objects is safe.
+      const idMap = new Map() // oldId → newId
+
       for (let i = 0; i < sortedObjects.length; i++) {
         const objName = sortedObjects[i]
         const csvText = csvData[objName]
@@ -215,9 +237,15 @@ export async function POST(request) {
 
         try {
           // ── 1. Describe target object — get only insertable fields ────
-          const describe        = await client.describeSObject(objName)
-          const createableSet   = new Set(
-            describe.fields.filter(f => f.createable).map(f => f.name)
+          const describe = await client.describeSObject(objName)
+          // Map of fieldName → SF type, for createable fields only.
+          // We need the type to coerce CSV strings back to proper JSON types
+          // before sending to the Composite API (booleans and numbers must not
+          // be strings or SF will reject them with a type error).
+          const createableFields = new Map(
+            describe.fields
+              .filter(f => f.createable)
+              .map(f => [f.name, f.type])
           )
 
           // ── 2. Parse the backup CSV ───────────────────────────────────
@@ -231,13 +259,18 @@ export async function POST(request) {
           const headers  = parsed[0]
           const dataRows = parsed.slice(1)
 
+          // Track the Id column so we can build the old→new mapping after insert.
+          // Id is never createable so it won't appear in keepCols — we read it
+          // separately here.
+          const idColIdx = headers.indexOf('Id')
+
           // ── 3. Filter to createable columns only ──────────────────────
           // This removes: Id, CreatedDate, LastModifiedDate, SystemModstamp,
           // formula fields, auto-number fields, etc. — anything the API
           // won't accept in an insert. Mirrors SFRewind's field validation.
           const keepCols = headers
-            .map((h, idx) => ({ h, idx }))
-            .filter(({ h }) => createableSet.has(h))
+            .map((h, idx) => ({ h, idx, type: createableFields.get(h) }))
+            .filter(({ type }) => type !== undefined)
 
           if (!keepCols.length) {
             emit.warn(`  ⚠ ${objName}: no createable fields found in backup CSV, skipping`)
@@ -253,19 +286,42 @@ export async function POST(request) {
           )
 
           // ── 4. Build record objects ────────────────────────────────────
-          const records = dataRows
-            .filter(row => row.some(c => c !== '')) // skip blank rows
-            .map(row => {
-              const rec = {}
-              for (const { h, idx } of keepCols) {
-                const val = row[idx] ?? ''
-                // Send null for empty strings so SF treats them as blank,
-                // not as the string "null". Skip entirely if empty to let
-                // default field values apply.
-                if (val !== '') rec[h] = val
+          // Coerce CSV strings back to the proper JSON types SF expects.
+          // For reference fields, remap old IDs → new IDs using idMap so that
+          // lookup fields on child objects point to the newly inserted parents.
+          const BOOLEAN_TYPES = new Set(['boolean'])
+          const NUMERIC_TYPES = new Set(['int', 'double', 'currency', 'percent'])
+
+          const filteredRows = dataRows.filter(row => row.some(c => c !== ''))
+
+          const records = filteredRows.map(row => {
+            const rec = {}
+            for (const { h, idx, type } of keepCols) {
+              const val = row[idx] ?? ''
+              if (val === '') continue // let SF default apply
+              if (BOOLEAN_TYPES.has(type)) {
+                rec[h] = val.toLowerCase() === 'true'
+              } else if (NUMERIC_TYPES.has(type)) {
+                const n = Number(val)
+                rec[h] = isNaN(n) ? val : n
+              } else if (type === 'reference') {
+                // Remap to new ID if this old ID was inserted in an earlier
+                // object. If not in idMap (e.g. OwnerId pointing to a User
+                // we didn't back up), keep the original — it may still be
+                // valid in this org.
+                rec[h] = idMap.get(val) ?? val
+              } else {
+                rec[h] = val
               }
-              return rec
-            })
+            }
+            return rec
+          })
+
+          // Collect old IDs in the same order as filteredRows so we can
+          // align them with the insert results below.
+          const oldIds = filteredRows.map(row =>
+            idColIdx >= 0 ? (row[idColIdx] || null) : null
+          )
 
           if (!records.length) {
             emit.info(`  ✓ ${objName}: 0 records to insert`)
@@ -273,18 +329,24 @@ export async function POST(request) {
             continue
           }
 
-          // ── 5. Batch insert ───────────────────────────────────────────
+          // ── 5. Batch insert + capture old→new ID mapping ──────────────
           let inserted  = 0
           let failed    = 0
           let shownErrs = 0
 
           for (let b = 0; b < records.length; b += BATCH_SIZE) {
-            const batch   = records.slice(b, b + BATCH_SIZE)
-            const results = await client.batchInsert(objName, batch)
+            const batch      = records.slice(b, b + BATCH_SIZE)
+            const batchOldIds = oldIds.slice(b, b + BATCH_SIZE)
+            const results    = await client.batchInsert(objName, batch)
 
-            for (const r of results) {
+            for (let j = 0; j < results.length; j++) {
+              const r = results[j]
               if (r.success) {
                 inserted++
+                // Register old → new ID so child objects can remap their
+                // reference fields before they are inserted.
+                const oldId = batchOldIds[j]
+                if (oldId && r.id) idMap.set(oldId, r.id)
               } else {
                 failed++
                 // Show first 3 distinct errors to keep the log readable
@@ -303,8 +365,10 @@ export async function POST(request) {
           stats.totalRecordsFailed   += failed
           stats.successfulObjects++
 
+          const remapped = keepCols.filter(c => c.type === 'reference').length
           const failNote = failed > 0 ? `, ${failed.toLocaleString()} failed` : ''
-          emit.success(`  ✓ ${objName}: ${inserted.toLocaleString()} inserted${failNote}`)
+          const remapNote = remapped > 0 ? ` · ${remapped} lookup field${remapped !== 1 ? 's' : ''} remapped` : ''
+          emit.success(`  ✓ ${objName}: ${inserted.toLocaleString()} inserted${failNote}${remapNote}`)
 
         } catch (err) {
           if (err.code === 'SESSION_EXPIRED') throw err
