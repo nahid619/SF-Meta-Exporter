@@ -1,3 +1,5 @@
+// app/api/auth/initiate/route.js
+
 import { NextResponse } from 'next/server'
 import { getSession } from '@/lib/session'
 import { ORG_URLS } from '@/lib/config'
@@ -24,10 +26,6 @@ function normaliseCustomDomain(raw) {
  *   1. NEXT_PUBLIC_APP_URL env var (explicit override, useful for production)
  *   2. Origin header (always sent by browsers in POST requests — most reliable)
  *   3. Host header (fallback for non-browser clients)
- *
- * This means the redirect_uri sent to Salesforce automatically matches
- * wherever the user is actually accessing the app from, removing the
- * env-var / URL mismatch problem entirely.
  */
 function buildRedirectUri(request) {
   // 1. Explicit env var override
@@ -57,7 +55,7 @@ function buildRedirectUri(request) {
 }
 
 export async function POST(request) {
-  const { consumerKey, orgType, domain } = await request.json()
+  const { consumerKey, orgType, domain, forceLogin } = await request.json()
 
   if (!consumerKey?.trim()) {
     return NextResponse.json(
@@ -79,6 +77,13 @@ export async function POST(request) {
   const redirectUri         = buildRedirectUri(request)
   const { verifier, challenge } = generatePKCEPair()
 
+  // Force Salesforce to show the login form even if there's an active session
+  // cookie. This is the root-cause fix for "after a failed attempt with a
+  // mismatched org/key, retrying immediately fails again without ever showing
+  // the login form". prompt=login is OAuth 2.0 standard and SF honours it.
+  //
+  // We always send it by default. The client can opt out with forceLogin: false
+  // if you ever want browser-cached SSO behaviour.
   const params = new URLSearchParams({
     response_type:         'code',
     client_id:             consumerKey.trim(),
@@ -86,6 +91,9 @@ export async function POST(request) {
     code_challenge:        challenge,
     code_challenge_method: 'S256',
   })
+  if (forceLogin !== false) {
+    params.set('prompt', 'login')
+  }
 
   const authUrl = `${sfBaseUrl}/services/oauth2/authorize?${params.toString()}`
 
