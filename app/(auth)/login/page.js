@@ -1,3 +1,4 @@
+// app/(auth)/login/page.js
 'use client'
 
 import { useState, useEffect, useRef } from 'react'
@@ -76,6 +77,7 @@ export default function LoginPage() {
   const [error,         setError]         = useState(null)
   const [statusMsg,     setStatusMsg]     = useState(null)
   const [showGuide,     setShowGuide]     = useState(false)
+  const [isResetting,   setIsResetting]   = useState(false)
 
   const popupRef = useRef(null)
   const pollRef  = useRef(null)
@@ -87,8 +89,23 @@ export default function LoginPage() {
 
   useEffect(() => () => {
     clearInterval(pollRef.current)
-    popupRef.current?.close?.()
+    try { popupRef.current?.close?.() } catch {}
+    popupRef.current = null
   }, [])
+
+  /**
+   * Builds the Salesforce session-logout URL for the currently selected org.
+   * Hitting this in a hidden popup clears the SF SSO cookie so the next
+   * authorize attempt can't be silently auto-approved against the wrong org.
+   */
+  function buildSfLogoutUrl() {
+    if (orgType === 'sandbox')    return 'https://test.salesforce.com/secur/logout.jsp'
+    if (orgType === 'custom' && customDomain.trim()) {
+      const host = customDomain.replace(/^https?:\/\//, '').replace(/\/$/, '').trim()
+      return `https://${host}/secur/logout.jsp`
+    }
+    return 'https://login.salesforce.com/secur/logout.jsp'
+  }
 
   async function handleLogin() {
     if (!consumerKey.trim()) {
@@ -99,7 +116,10 @@ export default function LoginPage() {
     setIsLoading(true)
     setError(null)
     setStatusMsg(null)
-    localStorage.setItem('sfmeta_consumer_key', consumerKey.trim())
+
+    // NOTE: we used to save the consumer key to localStorage here, before we
+    // knew it was valid. That made invalid keys sticky across page refreshes.
+    // It's now saved only after a successful exchange (see LOGIN_SUCCESS).
 
     try {
       const res  = await fetch('/api/auth/initiate', {
@@ -111,12 +131,20 @@ export default function LoginPage() {
 
       if (data.error) { setError(data.error); setIsLoading(false); return }
 
+      // Close any leftover popup from a previous attempt before opening a new
+      // one. Combined with the unique window name below, this guarantees the
+      // user gets a fresh popup every time, never a reused stale one.
+      try { popupRef.current?.close() } catch {}
+      popupRef.current = null
+
       const w = 620, h = 720
       const left = Math.round((window.screen.width - w) / 2)
       const top  = Math.round((window.screen.height - h) / 2)
 
+      // Unique window name per attempt — defeats browser named-target reuse.
+      const popupName = `sfmeta_auth_${Date.now()}`
       popupRef.current = window.open(
-        data.authUrl, 'sfmeta_auth',
+        data.authUrl, popupName,
         `width=${w},height=${h},left=${left},top=${top},toolbar=no,menubar=no,location=no`
       )
 
@@ -126,12 +154,18 @@ export default function LoginPage() {
         return
       }
 
+      // Bring the popup to the front. Without this, on some browsers a reused
+      // or backgrounded popup stays hidden behind the main window.
+      try { popupRef.current.focus() } catch {}
+
       setStatusMsg('Waiting for Salesforce login in popup…')
 
       function handleMessage(evt) {
         if (evt.origin !== window.location.origin) return
         if (evt.data === 'LOGIN_SUCCESS') {
           cleanup()
+          // Only persist the consumer key now that we know it works.
+          localStorage.setItem('sfmeta_consumer_key', consumerKey.trim())
           setStatusMsg('✓ Connected! Loading dashboard…')
           setTimeout(() => router.push('/dashboard'), 700)
         } else if (typeof evt.data === 'string' && evt.data.startsWith('LOGIN_ERROR:')) {
@@ -153,10 +187,58 @@ export default function LoginPage() {
       function cleanup() {
         window.removeEventListener('message', handleMessage)
         clearInterval(pollRef.current)
+        popupRef.current = null
       }
     } catch (err) {
       setError(err.message)
       setIsLoading(false)
+    }
+  }
+
+  /**
+   * "Start fresh" — gives the user an explicit recovery path when something
+   * has gone sideways. Clears:
+   *   1. Our own iron-session cookie (server-side)
+   *   2. The saved consumer key in localStorage
+   *   3. The Salesforce SSO cookie (best-effort, via hidden popup to /secur/logout.jsp)
+   *   4. Any in-memory error / status state on this page
+   */
+  async function handleReset() {
+    if (isResetting) return
+    setIsResetting(true)
+    setError(null)
+    setStatusMsg('Clearing session…')
+
+    try {
+      // 1. Nuke our own session
+      await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {})
+
+      // 2. Clear locally-cached consumer key
+      try { localStorage.removeItem('sfmeta_consumer_key') } catch {}
+      setConsumerKey('')
+
+      // 3. Best-effort: log the browser out of Salesforce. Different orgs
+      //    require different logout URLs, so we use the currently selected
+      //    one. Opens in a tiny offscreen popup and closes itself.
+      const logoutUrl = buildSfLogoutUrl()
+      const lw = window.open(
+        logoutUrl, `sf_logout_${Date.now()}`,
+        'width=420,height=300,left=-2000,top=-2000'
+      )
+      setTimeout(() => { try { lw?.close() } catch {} }, 1800)
+
+      // 4. Reset any popup state we were holding
+      try { popupRef.current?.close() } catch {}
+      popupRef.current = null
+      clearInterval(pollRef.current)
+
+      setStatusMsg('✓ Cleared. You can connect again with a fresh session.')
+      setTimeout(() => setStatusMsg(null), 2500)
+    } catch (err) {
+      setError(`Reset failed: ${err.message}`)
+    } finally {
+      setIsLoading(false)
+      setIsResetting(false)
     }
   }
 
@@ -311,17 +393,40 @@ export default function LoginPage() {
               </div>
             )}
 
-            {/* Button */}
+            {/* Connect button */}
             <button
               type="button"
               className="btn-primary"
               onClick={handleLogin}
-              disabled={isLoading}
+              disabled={isLoading || isResetting}
             >
               {isLoading
                 ? <><div className="spinner" /> Waiting for Salesforce…</>
                 : <>{SF_CLOUD} Connect with Salesforce</>
               }
+            </button>
+
+            {/* Reset / Start Fresh — explicit recovery path */}
+            <button
+              type="button"
+              onClick={handleReset}
+              disabled={isResetting}
+              title="Clear cached session and Salesforce login. Use this if you're switching orgs or got stuck on an error."
+              style={{
+                marginTop: '10px',
+                width: '100%',
+                padding: '8px 12px',
+                background: 'transparent',
+                border: '1px solid var(--border-hi)',
+                borderRadius: 'var(--radius-sm)',
+                color: 'var(--text-3)',
+                fontSize: '12px',
+                cursor: isResetting ? 'wait' : 'pointer',
+                fontFamily: 'var(--font-outfit)',
+                opacity: isResetting ? 0.6 : 1,
+              }}
+            >
+              {isResetting ? 'Clearing…' : '↻ Reset / Switch Org (clear cached session)'}
             </button>
 
             {error && <div className="form-error">⚠ {error}</div>}
