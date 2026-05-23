@@ -1,4 +1,3 @@
-// app/auth/callback/page.js
 'use client'
 
 import { useEffect, useState } from 'react'

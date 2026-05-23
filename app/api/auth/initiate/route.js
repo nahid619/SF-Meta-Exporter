@@ -1,5 +1,3 @@
-// app/api/auth/initiate/route.js
-
 import { NextResponse } from 'next/server'
 import { getSession } from '@/lib/session'
 import { ORG_URLS } from '@/lib/config'

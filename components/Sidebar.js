@@ -1,3 +1,5 @@
+// components/Sidebar.js
+
 'use client'
 
 import { useState } from 'react'
@@ -10,6 +12,7 @@ const NAV_ITEMS = [
   { id: 'soql',     icon: '💻', label: 'SOQL Runner',       href: '/dashboard/soql',      enabled: true },
   { id: 'switch',   icon: '⚡', label: 'SF Switch',         href: '/dashboard/switch',    enabled: true },
   { id: 'reports',  icon: '📈', label: 'Report Exporter',   href: '/dashboard/reports',   enabled: true },
+  { id: 'backup',   icon: '🔁', label: 'Backup & Restore',  href: '/dashboard/backup',    enabled: true },
 ]
 
 export default function Sidebar({ session }) {

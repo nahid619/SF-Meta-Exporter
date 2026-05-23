@@ -1,3 +1,5 @@
+// components/StatsSummary.js
+
 'use client'
 
 /**
@@ -36,6 +38,13 @@ const FIELD_CONFIG = {
 
   // Common
   runtimeFormatted:    { label: 'Runtime',                 color: null    },
+
+  // Backup stats (module 7)
+  totalRecords:          { label: 'Total records backed up',  color: null    },
+
+  // Restore stats (module 7)
+  totalRecordsInserted:  { label: 'Records inserted',         color: 'green' },
+  totalRecordsFailed:    { label: 'Records failed',           color: 'red'   },
 }
 
 function formatValue(key, val) {

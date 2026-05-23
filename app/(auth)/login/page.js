@@ -1,4 +1,3 @@
-// app/(auth)/login/page.js
 'use client'
 
 import { useState, useEffect, useRef } from 'react'
@@ -65,6 +64,7 @@ const MODULES = [
   { icon: '💻', label: 'SOQL Runner'        },
   { icon: '⚡', label: 'SF Switch'          },
   { icon: '📈', label: 'Report Exporter'    },
+  { icon: '🔁', label: 'Backup & Restore'   },
 ]
 
 export default function LoginPage() {
@@ -287,7 +287,7 @@ export default function LoginPage() {
             <div className="brand-divider" />
 
             <div style={{ fontSize: '11px', color: 'var(--text-3)', marginBottom: '10px', letterSpacing: '0.06em', textTransform: 'uppercase', fontWeight: 600 }}>
-              6 Modules
+              7 Modules
             </div>
 
             <div className="module-list">
