@@ -62,10 +62,15 @@ export async function POST(request) {
           // ── 1. Describe — get all queryable fields ─────────────────────
           const describe = await client.describeSObject(objName)
 
-          // Keep only fields that SOQL can SELECT; exclude deprecated ones.
-          // This mirrors backup_manager._export_object's field resolution.
+          // Keep only fields that SOQL can SELECT; exclude deprecated ones
+          // and compound types (address, location) which return nested objects
+          // that can't be flattened into a CSV cell.
+          // NOTE: f.queryable does NOT exist at the field level — it is an
+          // SObject-level property only. The correct check is to exclude
+          // compound types and deprecated/hidden fields.
+          const COMPOUND_TYPES = new Set(['address', 'location'])
           const queryableFields = describe.fields
-            .filter(f => f.queryable && !f.deprecatedAndHidden)
+            .filter(f => !f.deprecatedAndHidden && !COMPOUND_TYPES.has(f.type))
             .map(f => f.name)
 
           // Ensure Id is always present and first (needed for relationship

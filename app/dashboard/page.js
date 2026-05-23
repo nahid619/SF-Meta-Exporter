@@ -33,6 +33,11 @@ const MODULES = [
     href: '/dashboard/reports',
     desc: 'Export Salesforce reports preserving groupings, subtotals, and merged cell formatting.',
   },
+  {
+    id: 'backup', icon: '🔁', title: 'Backup & Restore', phase: 9, done: true,
+    href: '/dashboard/backup',
+    desc: 'Backup selected objects to a ZIP of CSVs, then restore them into any connected org. Dependency order resolved automatically.',
+  },
 ]
 
 export default async function DashboardPage() {

@@ -310,9 +310,9 @@ export default function BackupRestorePage() {
       {/* ── 3-PANEL MAIN AREA ────────────────────────────────────────────── */}
       <div style={{ flex: 1, display: 'flex', minHeight: 0, overflow: 'hidden' }}>
 
-        {/* ── PANEL 1: Configuration (40%) ─────────────────────────────── */}
+        {/* ── PANEL 1: Configuration (62%) ─────────────────────────────── */}
         <div style={{
-          width: '40%', display: 'flex', flexDirection: 'column', minHeight: 0,
+          width: '62%', display: 'flex', flexDirection: 'column', minHeight: 0,
           borderRight: '1px solid var(--border)',
         }}>
 
@@ -450,7 +450,7 @@ export default function BackupRestorePage() {
           </div>
         </div>
 
-        {/* ── PANEL 2: Progress + results (60%) ────────────────────────── */}
+        {/* ── PANEL 2: Progress + results (38%) ────────────────────────── */}
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
           <div style={{ flex: 1, overflowY: 'auto', padding: '20px 20px 20px' }}>
 
