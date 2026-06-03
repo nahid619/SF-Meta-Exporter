@@ -1,34 +1,45 @@
 /**
  * POST /api/content/export
  *
- * Mirrors content_document_exporter.py exactly.
- *
  * Flow:
  *   1. Query all ContentDocuments (paginated)
  *   2. Query ContentVersions in batches of 200 document IDs
- *   3. Download all versions concurrently (default: 10 at a time)
- *   4. Pack into ZIP: Documents/{sanitised_filename} + manifest.csv
- *   5. Base64-encode the ZIP and emit it directly in the SSE done event
+ *   3. Query ContentDocumentLink — resolves which SF object/record each file
+ *      is attached to. A file can link to multiple records, so values are
+ *      pipe-separated in the CSV columns.
+ *   4. Download all versions concurrently (default: 10 at a time)
+ *   5. Pack into ZIP:
+ *        Documents/{sanitised_filename}   — the actual files
+ *        manifest.csv                     — RFC 4180 CSV, opens cleanly in Excel
+ *   6. Base64-encode the ZIP and emit it directly in the SSE done event
  *      (avoids Vercel multi-instance job-store miss on the download request)
  *
+ * manifest.csv columns (new columns marked ★):
+ *   Title | PathOnClient | ContentDocumentId
+ *   ★ LinkedObjectNames | ★ LinkedRecordIds | ★ LinkedRecordCount
+ *   FirstPublishLocationId | Description | Origin
+ *   VersionNumber | IsLatestVersion | Total_Versions_Available
+ *   FileExtension | FileType | ContentSize (Bytes)
+ *   CreatedDate | LastModifiedDate | OwnerId
+ *   DownloadStatus | FailureReason
+ *
  * Body: {
- *   latestOnly?:    boolean   — download only IsLatest=true (default: false → all versions)
- *   maxConcurrent?: number    — parallel downloads, default 10 (mirrors ThreadPoolExecutor)
+ *   latestOnly?:    boolean  — download only IsLatest=true (default: false)
+ *   maxConcurrent?: number   — parallel downloads, default 10
  * }
  */
 
 import JSZip from 'jszip'
-import { getSession }    from '@/lib/session'
-import { SalesforceClient } from '@/lib/salesforce/client'
-import { createSSEStream }  from '@/lib/streaming/sse'
-import { rowsToCSV }        from '@/lib/files/csv'
+import { getSession }            from '@/lib/session'
+import { SalesforceClient }      from '@/lib/salesforce/client'
+import { createSSEStream }       from '@/lib/streaming/sse'
+import { rowsToCSV }             from '@/lib/files/csv'
 import { createContentDocStats } from '@/lib/models'
 import { formatRuntime, makeTimestamp } from '@/lib/config'
 import { checkRateLimit, rateLimitResponse, EXPORT_LIMIT } from '@/lib/rateLimit'
 
 // ── Filename helpers ──────────────────────────────────────────────────────────
 
-/** Mirrors _sanitize_filename() in content_document_exporter.py */
 function sanitizeFilename(name) {
   return String(name || 'untitled')
     .replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')
@@ -36,10 +47,6 @@ function sanitizeFilename(name) {
     .trim()
 }
 
-/**
- * Build the file's on-disk name.
- * Mirrors: f"{title}_{document_id}_v{version_number}.{file_extension}"
- */
 function buildFilename(title, docId, versionNumber, fileExtension) {
   const base = `${title}_${docId}_v${versionNumber}`
   return sanitizeFilename(fileExtension ? `${base}.${fileExtension}` : base)
@@ -65,8 +72,8 @@ async function queryVersions(client, docIds, latestOnly) {
   const all   = []
 
   for (let i = 0; i < docIds.length; i += CHUNK) {
-    const chunk    = docIds.slice(i, i + CHUNK)
-    const inClause = chunk.map(id => `'${id}'`).join(', ')
+    const chunk      = docIds.slice(i, i + CHUNK)
+    const inClause   = chunk.map(id => `'${id}'`).join(', ')
     const latestFilter = latestOnly ? ' AND IsLatest = true' : ''
 
     const soql = `
@@ -84,14 +91,65 @@ async function queryVersions(client, docIds, latestOnly) {
   return all
 }
 
+/**
+ * Query ContentDocumentLink for all doc IDs.
+ *
+ * ContentDocumentLink is the junction object between a ContentDocument and
+ * any Salesforce record. LinkedEntity.Type gives the object API name
+ * (Account, Contact, Opportunity, Case, ContentWorkspace for shared libraries,
+ * User for personal libraries, etc.).
+ *
+ * One file can be attached to multiple records simultaneously, so we build:
+ *   Map<docId, [ { objectName, recordId }, … ]>
+ *
+ * If the query fails due to permissions, we return an empty map and let the
+ * export continue — the three new columns will just be blank.
+ *
+ * @returns {Map<string, Array<{ objectName: string, recordId: string }>>}
+ */
+async function queryLinkedObjects(client, docIds) {
+  const CHUNK   = 200
+  const linkMap = new Map()
+  for (const id of docIds) linkMap.set(id, [])
+
+  for (let i = 0; i < docIds.length; i += CHUNK) {
+    const chunk    = docIds.slice(i, i + CHUNK)
+    const inClause = chunk.map(id => `'${id}'`).join(', ')
+
+    const soql = `
+      SELECT ContentDocumentId,
+             LinkedEntityId,
+             LinkedEntity.Type
+      FROM ContentDocumentLink
+      WHERE ContentDocumentId IN (${inClause})
+      ORDER BY ContentDocumentId
+    `
+
+    try {
+      const { records } = await client.queryAll(soql)
+      for (const link of records) {
+        const docId      = link.ContentDocumentId
+        const recordId   = link.LinkedEntityId
+        const objectName = link.LinkedEntity?.Type || 'Unknown'
+        if (!linkMap.has(docId)) linkMap.set(docId, [])
+        linkMap.get(docId).push({ objectName, recordId })
+      }
+    } catch (err) {
+      // Insufficient access — linkage columns will be empty, export continues
+      console.warn('[content/export] ContentDocumentLink query failed:', err.message)
+      break
+    }
+  }
+
+  return linkMap
+}
+
 // ── Concurrent download pool ──────────────────────────────────────────────────
 
 async function downloadWithConcurrency(items, processItem, maxConcurrent = 10) {
   if (!items.length) return []
-
   const queue   = [...items]
   const results = []
-
   async function worker() {
     while (queue.length > 0) {
       const item = queue.shift()
@@ -99,15 +157,12 @@ async function downloadWithConcurrency(items, processItem, maxConcurrent = 10) {
       results.push(await processItem(item))
     }
   }
-
-  const workerCount = Math.min(maxConcurrent, items.length)
-  await Promise.all(Array.from({ length: workerCount }, worker))
+  await Promise.all(Array.from({ length: Math.min(maxConcurrent, items.length) }, worker))
   return results
 }
 
 async function downloadVersionFile(client, version, maxAttempts = 3) {
   const url = `${client.instanceUrl}${version.VersionData}`
-
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const res = await fetch(url, {
@@ -125,10 +180,15 @@ async function downloadVersionFile(client, version, maxAttempts = 3) {
 
 // ── CSV manifest ──────────────────────────────────────────────────────────────
 
+// The three new linkage columns sit right after ContentDocumentId so they are
+// the first thing you see after identifying which file a row belongs to.
 const CSV_HEADERS = [
   'Title',
   'PathOnClient',
   'ContentDocumentId',
+  'LinkedObjectNames',          // e.g. "Account | Opportunity"  (new)
+  'LinkedRecordIds',            // e.g. "001xx000... | 006xx000..."  (new)
+  'LinkedRecordCount',          // e.g. 2  (new)
   'FirstPublishLocationId',
   'Description',
   'Origin',
@@ -150,9 +210,12 @@ function buildManifestCSV(versionRows) {
     r.docTitle,
     r.pathOnClient,
     r.docId,
-    '',
+    r.linkedObjectNames,          // pipe-separated object API names
+    r.linkedRecordIds,            // pipe-separated record IDs (same order)
+    String(r.linkedRecordCount),
+    '',                           // FirstPublishLocationId — user fills for DataLoader re-import
     r.docDescription || '',
-    'H',
+    'H',                          // Origin 'H' = uploaded file (matches Python)
     String(r.versionNumber),
     r.isLatest ? 'TRUE' : 'FALSE',
     String(r.totalVersions),
@@ -192,7 +255,7 @@ export async function POST(request) {
       const startMs = Date.now()
       const stats   = createContentDocStats()
 
-      // ── Step 1: Query ContentDocuments ──────────────────────────────────
+      // ── Step 1: Query ContentDocuments ────────────────────────────────
       emit.info('=== ContentDocument File Downloader ===')
       emit.info(`Mode: ${latestOnly ? 'Latest version only' : 'All versions'} | Concurrency: ${maxConcurrent}`)
       emit.info('Querying ContentDocument records…')
@@ -202,24 +265,24 @@ export async function POST(request) {
 
       if (docs.length === 0) {
         emit.warn('No ContentDocuments found in this org.')
-        const zip = new JSZip()
+        const zip      = new JSZip()
         zip.file('manifest.csv', rowsToCSV(CSV_HEADERS, []))
-        const buf = await zip.generateAsync({ type: 'nodebuffer' })
-        const b64 = buf.toString('base64')
+        const buf      = await zip.generateAsync({ type: 'nodebuffer' })
         const filename = `ContentDocument_Export_${makeTimestamp()}.zip`
-        emit.data({ type: 'done', zipBase64: b64, filename, stats })
+        emit.data({ type: 'done', zipBase64: buf.toString('base64'), filename, stats })
         return
       }
 
       emit.success(`Found ${docs.length} ContentDocument record(s)`)
 
+      const docIds = docs.map(d => d.Id)
       const docMap = new Map(docs.map(d => [d.Id, d]))
 
-      // ── Step 2: Query ContentVersions ───────────────────────────────────
+      // ── Step 2: Query ContentVersions ─────────────────────────────────
       emit.info(`Fetching ${latestOnly ? 'latest' : 'all'} versions…`)
       emit.progress(5, 'Querying versions…')
 
-      const versions = await queryVersions(client, docs.map(d => d.Id), latestOnly)
+      const versions = await queryVersions(client, docIds, latestOnly)
       stats.totalVersions = versions.length
       emit.success(`Found ${versions.length} version(s) to download`)
 
@@ -228,7 +291,23 @@ export async function POST(request) {
         totalVersionsByDoc.set(v.ContentDocumentId, (totalVersionsByDoc.get(v.ContentDocumentId) || 0) + 1)
       }
 
-      // ── Step 3: Concurrent downloads ─────────────────────────────────────
+      // ── Step 3: Query ContentDocumentLink (object linkage) ────────────
+      emit.info('Resolving object linkage via ContentDocumentLink…')
+      emit.progress(8, 'Querying object links…')
+
+      const linkMap         = await queryLinkedObjects(client, docIds)
+      const objectTypesSeen = new Set()
+      for (const links of linkMap.values()) {
+        for (const { objectName } of links) objectTypesSeen.add(objectName)
+      }
+
+      if (objectTypesSeen.size > 0) {
+        emit.success(`Object types found: ${[...objectTypesSeen].sort().join(', ')}`)
+      } else {
+        emit.warn('No ContentDocumentLink records found — LinkedObjectNames will be empty.')
+      }
+
+      // ── Step 4: Concurrent downloads ──────────────────────────────────
       emit.info(`Starting ${maxConcurrent}-concurrent downloads…`)
 
       const zip          = new JSZip()
@@ -245,9 +324,13 @@ export async function POST(request) {
         const totalVers    = totalVersionsByDoc.get(version.ContentDocumentId) || 1
         const pathOnClient = `Documents/${filename}`
 
-        dlCount++
-        const pct = Math.round((dlCount / versions.length) * 85) + 5
+        const links             = linkMap.get(version.ContentDocumentId) || []
+        const linkedObjectNames = links.map(l => l.objectName).join(' | ') || ''
+        const linkedRecordIds   = links.map(l => l.recordId).join(' | ')   || ''
+        const linkedRecordCount = links.length
 
+        dlCount++
+        const pct = Math.round((dlCount / versions.length) * 82) + 10
         emit.progress(pct, `[${dlCount}/${versions.length}] ${filename}`, (Date.now() - startMs) / 1000)
 
         try {
@@ -257,11 +340,15 @@ export async function POST(request) {
           stats.totalSizeBytes      += buffer.byteLength
           stats.successfulDownloads++
 
-          emit.info(`  ✓ ${filename} (${(buffer.byteLength / 1024).toFixed(1)} KB)`)
+          emit.info(
+            `  ✓ ${filename} (${(buffer.byteLength / 1024).toFixed(1)} KB)` +
+            (linkedObjectNames ? ` — ${linkedObjectNames}` : '')
+          )
 
           manifestRows.push({
             docTitle: title, pathOnClient,
             docId: version.ContentDocumentId, docDescription: doc?.Description || '',
+            linkedObjectNames, linkedRecordIds, linkedRecordCount,
             versionNumber: version.VersionNumber, isLatest: version.IsLatest,
             totalVersions: totalVers, fileExtension: fileExt, fileType,
             contentSize: version.ContentSize, createdDate: version.CreatedDate,
@@ -271,12 +358,12 @@ export async function POST(request) {
         } catch (err) {
           stats.failedDownloads++
           stats.failedFiles.push({ id: version.ContentDocumentId, filename, version: version.VersionNumber, reason: err.message })
-
           emit.error(`  ✗ ${filename}: ${err.message}`)
 
           manifestRows.push({
             docTitle: title, pathOnClient,
             docId: version.ContentDocumentId, docDescription: doc?.Description || '',
+            linkedObjectNames, linkedRecordIds, linkedRecordCount,
             versionNumber: version.VersionNumber, isLatest: version.IsLatest,
             totalVersions: totalVers, fileExtension: fileExt, fileType,
             contentSize: version.ContentSize, createdDate: version.CreatedDate,
@@ -286,11 +373,11 @@ export async function POST(request) {
         }
       }, maxConcurrent)
 
-      // ── Step 4: Build CSV manifest + ZIP ─────────────────────────────────
-      emit.progress(92, 'Building CSV manifest…')
+      // ── Step 5: Build CSV manifest + ZIP ──────────────────────────────
+      emit.progress(94, 'Building CSV manifest…')
       zip.file('manifest.csv', buildManifestCSV(manifestRows))
 
-      emit.progress(95, 'Generating ZIP archive…')
+      emit.progress(97, 'Generating ZIP archive…')
 
       const elapsed = (Date.now() - startMs) / 1000
       stats.runtimeFormatted = formatRuntime(elapsed)
@@ -301,11 +388,8 @@ export async function POST(request) {
         compressionOptions: { level: 6 },
       })
 
-      // Encode ZIP as base64 and send it directly in the SSE stream.
-      // This avoids the Vercel multi-instance job-store miss: no second
-      // GET request is needed — the client reconstructs the file in-browser.
-      const zipBase64  = zipBuffer.toString('base64')
-      const filename   = `ContentDocument_Export_${makeTimestamp()}.zip`
+      const zipBase64 = zipBuffer.toString('base64')
+      const filename  = `ContentDocument_Export_${makeTimestamp()}.zip`
 
       emit.data({ type: 'done', zipBase64, filename, stats })
       emit.success(
