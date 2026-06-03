@@ -1,3 +1,4 @@
+// FILE PATH: components/Sidebar.js
 // components/Sidebar.js
 
 'use client'
@@ -8,7 +9,8 @@ import { useRouter, usePathname } from 'next/navigation'
 const NAV_ITEMS = [
   { id: 'picklist', icon: '📊', label: 'Picklist Exporter', href: '/dashboard/picklist',  enabled: true },
   { id: 'metadata', icon: '🔍', label: 'Metadata Exporter', href: '/dashboard/metadata',  enabled: true },
-  { id: 'files',    icon: '📁', label: 'File Downloader',   href: '/dashboard/files',     enabled: true },
+  { id: 'files',      icon: '📁', label: 'File Downloader',      href: '/dashboard/files',      enabled: true },
+  { id: 'attachment', icon: '🗂', label: 'Attachment Downloader', href: '/dashboard/attachment', enabled: true },
   { id: 'soql',     icon: '💻', label: 'SOQL Runner',       href: '/dashboard/soql',      enabled: true },
   { id: 'switch',   icon: '⚡', label: 'SF Switch',         href: '/dashboard/switch',    enabled: true },
   { id: 'reports',  icon: '📈', label: 'Report Exporter',   href: '/dashboard/reports',   enabled: true },

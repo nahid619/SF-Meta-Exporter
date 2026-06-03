@@ -1,3 +1,4 @@
+// FILE PATH: hooks/useExport.js
 'use client'
 
 /**
@@ -124,13 +125,19 @@ export function useExport() {
               if (evt.message) log('info', evt.message)
               break
 
+            case 'stats':
+              // Live per-object stats update (Attachment Downloader).
+              // Emitted after every file download so the UI cards update in real time.
+              setStats(prev => ({ ...(prev ?? {}), ...(evt.stats ?? {}) }))
+              break
+
             case 'done':
-              // Handle inline ZIP delivery (File Downloader module).
+              // Handle inline ZIP delivery (File Downloader / Attachment Downloader).
               // The server embeds the ZIP as base64 directly in the SSE event
               // to avoid the Vercel multi-instance job-store 404 problem.
               if (evt.zipBase64) {
                 const dataUri = `data:application/zip;base64,${evt.zipBase64}`
-                const statsWithFilename = { ...(evt.stats ?? {}), _filename: evt.filename || 'ContentDocument_Export.zip' }
+                const statsWithFilename = { ...(evt.stats ?? {}), _filename: evt.filename || 'Export.zip' }
                 setDownloadUrl(dataUri)
                 setStats(statsWithFilename)
               } else {

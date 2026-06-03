@@ -2,22 +2,19 @@
 /**
  * POST /api/attachment/export
  *
- * Downloads Salesforce legacy Attachment records (the classic pre-ContentDocument
- * attachment model). Attachments are stored directly on parent records (Accounts,
- * Cases, Contacts, etc.) and have been superseded by ContentDocument/ContentVersion
- * in modern Salesforce orgs — but many orgs still carry years of legacy attachments.
+ * Downloads Salesforce legacy Attachment records filtered by parent object type.
+ * Since an Attachment always belongs to exactly one parent record, we can filter
+ * precisely by querying WHERE Parent.Type IN (...selectedObjects).
  *
  * Flow:
- *   1. Query all Attachment records (paginated) with full metadata
- *   2. Download each Attachment.Body blob via the REST API
- *   3. Pack into ZIP:
- *        Attachments/{AttachmentId}_{Name}   — the actual files
- *        attachment_manifest.csv             — DataLoader-compatible CSV
- *   4. Base64-encode the ZIP and emit it directly in the SSE done event
- *      (same inline-delivery pattern as /api/content/export — avoids
- *       Vercel multi-instance job-store misses)
+ *   1. For each selected object type — query its Attachments, download bodies,
+ *      emit per-object SSE progress events
+ *   2. All files packed into one ZIP:
+ *        Attachments/{Name}_{Id}.{ext}   — the actual files
+ *        attachment_manifest.csv         — DataLoader-compatible CSV
+ *   3. Base64-encode the ZIP and emit it directly in the SSE done event
  *
- * attachment_manifest.csv columns (industry-standard for SF Attachment migration):
+ * attachment_manifest.csv columns:
  *   Id | Name | ParentId | ParentType | ParentName
  *   ContentType | BodyLength (Bytes) | IsPrivate
  *   Description | OwnerId | OwnerName
@@ -25,7 +22,8 @@
  *   PathInZip | DownloadStatus | FailureReason
  *
  * Body: {
- *   maxConcurrent?: number  — parallel downloads, default 10
+ *   objects:       string[]  — parent object API names to filter by (e.g. ['Account','Case'])
+ *   maxConcurrent?: number   — parallel downloads per object, default 10
  * }
  */
 
@@ -48,10 +46,8 @@ function sanitizeFilename(name) {
 }
 
 /**
- * Build a unique filename for an Attachment.
- * Format: {AttachmentId}_{Name}
- * Using the Id prefix guarantees uniqueness even when two attachments
- * on different parents share the same Name.
+ * {Name}_{Id}.{ext}
+ * Extension is pulled from the sanitized name — guaranteed to be last.
  */
 function buildAttachmentFilename(attachmentId, name) {
   const safe     = sanitizeFilename(name)
@@ -65,16 +61,11 @@ function buildAttachmentFilename(attachmentId, name) {
 // ── Salesforce queries ────────────────────────────────────────────────────────
 
 /**
- * Query all Attachment records with full metadata.
- *
- * We fetch Parent.Type and Parent.Name via the relationship traversal.
- * If the org has restricted visibility on certain parent types (e.g. deleted
- * parents), those rows still appear but with null parent info — handled below.
- *
- * BodyLength is returned in bytes. The actual Body blob is fetched separately
- * via the REST /sobjects/Attachment/{Id}/Body endpoint.
+ * Query Attachments for a single parent object type.
+ * Parent.Type is the object API name (e.g. "Account").
+ * We query one object at a time so we can emit per-object SSE progress.
  */
-async function queryAttachments(client) {
+async function queryAttachmentsForObject(client, objectType) {
   const soql = `
     SELECT
       Id,
@@ -93,6 +84,7 @@ async function queryAttachments(client) {
       LastModifiedById,
       LastModifiedDate
     FROM Attachment
+    WHERE Parent.Type = '${objectType}'
     ORDER BY CreatedDate DESC
   `
   const { records, totalSize } = await client.queryAll(soql)
@@ -117,12 +109,8 @@ async function downloadWithConcurrency(items, processItem, maxConcurrent = 10) {
 }
 
 /**
- * Download the binary body of a single Attachment.
- *
- * The actual bytes are served at:
+ * Download the binary body of a single Attachment via:
  *   /services/data/v{ver}/sobjects/Attachment/{Id}/Body
- *
- * Retries up to maxAttempts times with linear back-off on transient errors.
  */
 async function downloadAttachmentBody(client, attachmentId, maxAttempts = 3) {
   const url = `${client.instanceUrl}/services/data/v${client.apiVersion}/sobjects/Attachment/${attachmentId}/Body`
@@ -143,28 +131,6 @@ async function downloadAttachmentBody(client, attachmentId, maxAttempts = 3) {
 
 // ── CSV manifest ──────────────────────────────────────────────────────────────
 
-/**
- * Industry-standard columns for Salesforce Attachment migration/audit CSVs.
- *
- * Column rationale:
- *   Id, Name           — primary identifiers; Id is the 15/18-char SF record ID
- *   ParentId           — the record this attachment belongs to (DataLoader FK)
- *   ParentType         — object API name of the parent (e.g. Account, Case)
- *   ParentName         — human-readable parent record name for triage
- *   ContentType        — MIME type (e.g. application/pdf, image/jpeg)
- *   BodyLength (Bytes) — file size; helps identify oversized attachments
- *   IsPrivate          — private attachments visible only to owner and admins
- *   Description        — optional metadata set by the uploader
- *   OwnerId            — SF user ID of the record owner
- *   OwnerName          — human-readable owner name for triage
- *   CreatedById        — user who originally uploaded the attachment
- *   CreatedDate        — upload timestamp; useful for retention/archival policies
- *   LastModifiedById   — last modifier
- *   LastModifiedDate   — last modified timestamp
- *   PathInZip          — exact path inside the ZIP for re-import scripting
- *   DownloadStatus     — Success | Failed
- *   FailureReason      — error detail when DownloadStatus = Failed
- */
 const ATTACHMENT_CSV_HEADERS = [
   'Id',
   'Name',
@@ -214,8 +180,13 @@ function buildAttachmentManifestCSV(rows) {
 
 export async function POST(request) {
   const {
+    objects       = [],
     maxConcurrent = 10,
   } = await request.json()
+
+  if (!objects.length) {
+    return Response.json({ error: 'No objects selected.' }, { status: 400 })
+  }
 
   const session = await getSession()
   if (!session.accessToken) {
@@ -233,111 +204,144 @@ export async function POST(request) {
       const startMs = Date.now()
       const stats   = createAttachmentStats()
 
-      // ── Step 1: Query all Attachments ─────────────────────────────────
+      // objectResults drives the per-object progress cards in the UI
+      stats.objectResults = objects.map(name => ({
+        objectName:   name,
+        found:        null,   // null = not queried yet
+        downloaded:   0,
+        failed:       0,
+        sizeMb:       '0.0',
+        done:         false,
+      }))
+
       emit.info('=== Legacy Attachment Downloader ===')
-      emit.info(`Concurrency: ${maxConcurrent}`)
-      emit.info('Querying Attachment records…')
-      emit.progress(3, 'Querying Attachment records…')
-
-      let records
-      try {
-        ;({ records } = await queryAttachments(client))
-      } catch (err) {
-        if (/insufficient access|INSUFFICIENT_ACCESS/i.test(err.message)) {
-          emit.error(
-            'Insufficient permissions to query Attachment records. ' +
-            'Ensure your profile has "Read" access on the Attachment object.'
-          )
-        } else {
-          throw err
-        }
-        return
-      }
-
-      stats.totalAttachments = records.length
-
-      if (records.length === 0) {
-        emit.warn('No Attachment records found in this org.')
-        const zip      = new JSZip()
-        zip.file('attachment_manifest.csv', rowsToCSV(ATTACHMENT_CSV_HEADERS, []))
-        const buf      = await zip.generateAsync({ type: 'nodebuffer' })
-        const filename = `Attachment_Export_${makeTimestamp()}.zip`
-        emit.data({ type: 'done', zipBase64: buf.toString('base64'), filename, stats })
-        return
-      }
-
-      emit.success(`Found ${records.length.toLocaleString()} Attachment record(s)`)
-      emit.progress(8, 'Preparing downloads…')
-
-      // ── Step 2: Concurrent body downloads ─────────────────────────────
-      emit.info(`Starting ${maxConcurrent}-concurrent downloads…`)
+      emit.info(`Objects: ${objects.join(', ')} | Concurrency: ${maxConcurrent}`)
 
       const zip               = new JSZip()
       const attachmentsFolder = zip.folder('Attachments')
-      const manifestRows      = []
-      let   dlCount           = 0
+      const allManifestRows   = []
 
-      await downloadWithConcurrency(records, async (attachment) => {
-        const filename  = buildAttachmentFilename(attachment.Id, attachment.Name)
-        const pathInZip = `Attachments/${filename}`
+      // ── Process each object type in sequence ──────────────────────────
+      for (let objIdx = 0; objIdx < objects.length; objIdx++) {
+        const objectType = objects[objIdx]
+        const objResult  = stats.objectResults[objIdx]
 
-        dlCount++
-        const pct = Math.round((dlCount / records.length) * 84) + 10
-        emit.progress(
-          pct,
-          `[${dlCount}/${records.length}] ${filename}`,
-          (Date.now() - startMs) / 1000,
-        )
+        emit.info(`── ${objectType} ──`)
+        emit.info(`Querying Attachment records where Parent.Type = '${objectType}'…`)
 
-        // Resolve relationship fields (may be null if parent is deleted/restricted)
-        const parentType = attachment.Parent?.Type || ''
-        const parentName = attachment.Parent?.Name || ''
-        const ownerName  = attachment.Owner?.Name  || ''
+        const overallPctBase = Math.round((objIdx / objects.length) * 90)
 
+        // Query
+        let records
         try {
-          const buffer = await downloadAttachmentBody(client, attachment.Id)
+          ;({ records } = await queryAttachmentsForObject(client, objectType))
+        } catch (err) {
+          if (/insufficient access|INSUFFICIENT_ACCESS/i.test(err.message)) {
+            emit.error(`  ${objectType}: Insufficient permissions to query Attachments.`)
+          } else {
+            emit.error(`  ${objectType}: Query failed — ${err.message}`)
+          }
+          objResult.done  = true
+          objResult.found = 0
+          stats.objectResults = [...stats.objectResults]
+          emit.data({ type: 'stats', stats: { ...stats } })
+          continue
+        }
 
-          attachmentsFolder.file(filename, buffer)
-          stats.totalSizeBytes      += buffer.byteLength
-          stats.successfulDownloads++
+        objResult.found        = records.length
+        stats.totalAttachments += records.length
+        emit.data({ type: 'stats', stats: { ...stats } })
 
-          const sizeKb = (buffer.byteLength / 1024).toFixed(1)
-          emit.info(
-            `  ✓ ${filename} (${sizeKb} KB)` +
-            (parentName ? ` — ${parentType}: ${parentName}` : '')
+        if (records.length === 0) {
+          emit.warn(`  ${objectType}: No Attachments found.`)
+          objResult.done = true
+          emit.data({ type: 'stats', stats: { ...stats } })
+          continue
+        }
+
+        emit.success(`  ${objectType}: Found ${records.length} Attachment(s)`)
+
+        // Download
+        let objSizeBytes = 0
+        let dlCount      = 0
+
+        await downloadWithConcurrency(records, async (attachment) => {
+          const filename  = buildAttachmentFilename(attachment.Id, attachment.Name)
+          const pathInZip = `Attachments/${filename}`
+
+          dlCount++
+          const withinObjPct = Math.round((dlCount / records.length) * (90 / objects.length))
+          const pct = overallPctBase + withinObjPct
+          emit.progress(
+            pct,
+            `[${objectType}] [${dlCount}/${records.length}] ${filename}`,
+            (Date.now() - startMs) / 1000,
           )
 
-          manifestRows.push({
-            id: attachment.Id, name: attachment.Name,
-            parentId: attachment.ParentId, parentType, parentName,
-            contentType: attachment.ContentType, bodyLength: attachment.BodyLength,
-            isPrivate: attachment.IsPrivate, description: attachment.Description,
-            ownerId: attachment.OwnerId, ownerName,
-            createdById: attachment.CreatedById, createdDate: attachment.CreatedDate,
-            lastModifiedById: attachment.LastModifiedById, lastModifiedDate: attachment.LastModifiedDate,
-            pathInZip, success: true,
-          })
-        } catch (err) {
-          stats.failedDownloads++
-          stats.failedFiles.push({ id: attachment.Id, filename, reason: err.message })
-          emit.error(`  ✗ ${filename}: ${err.message}`)
+          const parentType = attachment.Parent?.Type || objectType
+          const parentName = attachment.Parent?.Name || ''
+          const ownerName  = attachment.Owner?.Name  || ''
 
-          manifestRows.push({
-            id: attachment.Id, name: attachment.Name,
-            parentId: attachment.ParentId, parentType, parentName,
-            contentType: attachment.ContentType, bodyLength: attachment.BodyLength,
-            isPrivate: attachment.IsPrivate, description: attachment.Description,
-            ownerId: attachment.OwnerId, ownerName,
-            createdById: attachment.CreatedById, createdDate: attachment.CreatedDate,
-            lastModifiedById: attachment.LastModifiedById, lastModifiedDate: attachment.LastModifiedDate,
-            pathInZip, success: false, error: err.message,
-          })
-        }
-      }, maxConcurrent)
+          try {
+            const buffer = await downloadAttachmentBody(client, attachment.Id)
 
-      // ── Step 3: Build manifest CSV + ZIP ──────────────────────────────
+            attachmentsFolder.file(filename, buffer)
+            objSizeBytes              += buffer.byteLength
+            stats.totalSizeBytes      += buffer.byteLength
+            stats.successfulDownloads++
+            objResult.downloaded++
+            objResult.sizeMb = (objSizeBytes / 1024 / 1024).toFixed(1)
+
+            emit.info(
+              `  ✓ ${filename} (${(buffer.byteLength / 1024).toFixed(1)} KB)` +
+              (parentName ? ` — ${parentName}` : '')
+            )
+
+            allManifestRows.push({
+              id: attachment.Id, name: attachment.Name,
+              parentId: attachment.ParentId, parentType, parentName,
+              contentType: attachment.ContentType, bodyLength: attachment.BodyLength,
+              isPrivate: attachment.IsPrivate, description: attachment.Description,
+              ownerId: attachment.OwnerId, ownerName,
+              createdById: attachment.CreatedById, createdDate: attachment.CreatedDate,
+              lastModifiedById: attachment.LastModifiedById, lastModifiedDate: attachment.LastModifiedDate,
+              pathInZip, success: true,
+            })
+          } catch (err) {
+            stats.failedDownloads++
+            objResult.failed++
+            stats.failedFiles.push({ id: attachment.Id, filename, reason: err.message })
+            emit.error(`  ✗ ${filename}: ${err.message}`)
+
+            allManifestRows.push({
+              id: attachment.Id, name: attachment.Name,
+              parentId: attachment.ParentId, parentType, parentName,
+              contentType: attachment.ContentType, bodyLength: attachment.BodyLength,
+              isPrivate: attachment.IsPrivate, description: attachment.Description,
+              ownerId: attachment.OwnerId, ownerName,
+              createdById: attachment.CreatedById, createdDate: attachment.CreatedDate,
+              lastModifiedById: attachment.LastModifiedById, lastModifiedDate: attachment.LastModifiedDate,
+              pathInZip, success: false, error: err.message,
+            })
+          }
+
+          // Push updated stats after every download so the UI cards update live
+          emit.data({ type: 'stats', stats: { ...stats } })
+        }, maxConcurrent)
+
+        objResult.done   = true
+        objResult.sizeMb = (objSizeBytes / 1024 / 1024).toFixed(1)
+        emit.success(
+          `  ${objectType}: ${objResult.downloaded} downloaded` +
+          (objResult.failed > 0 ? `, ${objResult.failed} failed` : '') +
+          ` — ${objResult.sizeMb} MB`
+        )
+        emit.data({ type: 'stats', stats: { ...stats } })
+      }
+
+      // ── Build manifest + ZIP ──────────────────────────────────────────
       emit.progress(95, 'Building attachment_manifest.csv…')
-      zip.file('attachment_manifest.csv', buildAttachmentManifestCSV(manifestRows))
+      zip.file('attachment_manifest.csv', buildAttachmentManifestCSV(allManifestRows))
 
       emit.progress(98, 'Generating ZIP archive…')
 

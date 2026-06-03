@@ -17,7 +17,7 @@ const MODULES = [
   {
     id: 'files', icon: '📁', title: 'File Downloader', phase: 5, done: true,
     href: '/dashboard/files',
-    desc: 'Bulk-download ContentDocuments and optionally legacy Attachments — concurrent streams, ZIP output, and DataLoader-compatible CSV manifests.',
+    desc: 'Bulk-download ContentDocuments with concurrent streams, ZIP output, and a DataLoader-compatible file_manifest.csv.',
   },
   {
     id: 'soql', icon: '💻', title: 'SOQL Runner', phase: 6, done: true,
@@ -39,10 +39,15 @@ const MODULES = [
     href: '/dashboard/backup',
     desc: 'Backup selected objects to a ZIP of CSVs, then restore them into any connected org. Dependency order resolved automatically.',
   },
+  {
+    id: 'attachment', icon: '🗂', title: 'Attachment Downloader', phase: 10, done: true,
+    href: '/dashboard/attachment',
+    desc: 'Download legacy Salesforce Attachments filtered by parent object — choose exactly which objects to pull from, with per-object progress and a DataLoader-compatible attachment_manifest.csv.',
+  },
 ]
 
 export default async function DashboardPage() {
-  const session = await getSession()
+  const session  = await getSession()
   const orgLabel = { production: 'Production', sandbox: 'Sandbox', custom: 'Custom Domain' }[session.orgType] ?? 'Salesforce'
 
   return (
@@ -58,15 +63,11 @@ export default async function DashboardPage() {
         </p>
       </div>
 
-      {/* Progress banner */}
       <div style={{ marginBottom: '24px', padding: '14px 18px', background: 'var(--accent-dim)', border: '1px solid var(--accent)', borderRadius: 'var(--radius-md)', fontSize: '13px', color: '#bfdbfe', display: 'flex', alignItems: 'center', gap: '10px' }}>
         <span style={{ fontSize: '18px' }}>✅</span>
-        <span>
-          <strong>Click a module card below to start exporting.</strong>
-        </span>
+        <span><strong>Click a module card below to start exporting.</strong></span>
       </div>
 
-      {/* Module cards */}
       <div className="modules-grid">
         {MODULES.map(mod => (
           <a
