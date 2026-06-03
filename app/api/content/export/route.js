@@ -1,3 +1,4 @@
+// FILE PATH: app/api/content/export/route.js
 /**
  * POST /api/content/export
  *
@@ -9,12 +10,12 @@
  *      pipe-separated in the CSV columns.
  *   4. Download all versions concurrently (default: 10 at a time)
  *   5. Pack into ZIP:
- *        Documents/{sanitised_filename}   — the actual files
- *        manifest.csv                     — RFC 4180 CSV, opens cleanly in Excel
+ *        Files/{sanitised_filename}   — the actual files
+ *        file_manifest.csv            — RFC 4180 CSV, opens cleanly in Excel
  *   6. Base64-encode the ZIP and emit it directly in the SSE done event
  *      (avoids Vercel multi-instance job-store miss on the download request)
  *
- * manifest.csv columns (new columns marked ★):
+ * file_manifest.csv columns (new columns marked ★):
  *   Title | PathOnClient | ContentDocumentId
  *   ★ LinkedObjectNames | ★ LinkedRecordIds | ★ LinkedRecordCount
  *   FirstPublishLocationId | Description | Origin
@@ -93,19 +94,7 @@ async function queryVersions(client, docIds, latestOnly) {
 
 /**
  * Query ContentDocumentLink for all doc IDs.
- *
- * ContentDocumentLink is the junction object between a ContentDocument and
- * any Salesforce record. LinkedEntity.Type gives the object API name
- * (Account, Contact, Opportunity, Case, ContentWorkspace for shared libraries,
- * User for personal libraries, etc.).
- *
- * One file can be attached to multiple records simultaneously, so we build:
- *   Map<docId, [ { objectName, recordId }, … ]>
- *
- * If the query fails due to permissions, we return an empty map and let the
- * export continue — the three new columns will just be blank.
- *
- * @returns {Map<string, Array<{ objectName: string, recordId: string }>>}
+ * Returns Map<docId, [ { objectName, recordId }, … ]>
  */
 async function queryLinkedObjects(client, docIds) {
   const CHUNK   = 200
@@ -135,7 +124,6 @@ async function queryLinkedObjects(client, docIds) {
         linkMap.get(docId).push({ objectName, recordId })
       }
     } catch (err) {
-      // Insufficient access — linkage columns will be empty, export continues
       console.warn('[content/export] ContentDocumentLink query failed:', err.message)
       break
     }
@@ -180,15 +168,13 @@ async function downloadVersionFile(client, version, maxAttempts = 3) {
 
 // ── CSV manifest ──────────────────────────────────────────────────────────────
 
-// The three new linkage columns sit right after ContentDocumentId so they are
-// the first thing you see after identifying which file a row belongs to.
 const CSV_HEADERS = [
   'Title',
   'PathOnClient',
   'ContentDocumentId',
-  'LinkedObjectNames',          // e.g. "Account | Opportunity"  (new)
-  'LinkedRecordIds',            // e.g. "001xx000... | 006xx000..."  (new)
-  'LinkedRecordCount',          // e.g. 2  (new)
+  'LinkedObjectNames',
+  'LinkedRecordIds',
+  'LinkedRecordCount',
   'FirstPublishLocationId',
   'Description',
   'Origin',
@@ -210,12 +196,12 @@ function buildManifestCSV(versionRows) {
     r.docTitle,
     r.pathOnClient,
     r.docId,
-    r.linkedObjectNames,          // pipe-separated object API names
-    r.linkedRecordIds,            // pipe-separated record IDs (same order)
+    r.linkedObjectNames,
+    r.linkedRecordIds,
     String(r.linkedRecordCount),
-    '',                           // FirstPublishLocationId — user fills for DataLoader re-import
+    '',
     r.docDescription || '',
-    'H',                          // Origin 'H' = uploaded file (matches Python)
+    'H',
     String(r.versionNumber),
     r.isLatest ? 'TRUE' : 'FALSE',
     String(r.totalVersions),
@@ -266,7 +252,7 @@ export async function POST(request) {
       if (docs.length === 0) {
         emit.warn('No ContentDocuments found in this org.')
         const zip      = new JSZip()
-        zip.file('manifest.csv', rowsToCSV(CSV_HEADERS, []))
+        zip.file('file_manifest.csv', rowsToCSV(CSV_HEADERS, []))
         const buf      = await zip.generateAsync({ type: 'nodebuffer' })
         const filename = `ContentDocument_Export_${makeTimestamp()}.zip`
         emit.data({ type: 'done', zipBase64: buf.toString('base64'), filename, stats })
@@ -291,7 +277,7 @@ export async function POST(request) {
         totalVersionsByDoc.set(v.ContentDocumentId, (totalVersionsByDoc.get(v.ContentDocumentId) || 0) + 1)
       }
 
-      // ── Step 3: Query ContentDocumentLink (object linkage) ────────────
+      // ── Step 3: Query ContentDocumentLink ─────────────────────────────
       emit.info('Resolving object linkage via ContentDocumentLink…')
       emit.progress(8, 'Querying object links…')
 
@@ -311,7 +297,7 @@ export async function POST(request) {
       emit.info(`Starting ${maxConcurrent}-concurrent downloads…`)
 
       const zip          = new JSZip()
-      const docsFolder   = zip.folder('Documents')
+      const docsFolder   = zip.folder('Files')
       const manifestRows = []
       let   dlCount      = 0
 
@@ -322,7 +308,7 @@ export async function POST(request) {
         const fileType     = doc?.FileType      || ''
         const filename     = buildFilename(title, version.ContentDocumentId, version.VersionNumber, fileExt)
         const totalVers    = totalVersionsByDoc.get(version.ContentDocumentId) || 1
-        const pathOnClient = `Documents/${filename}`
+        const pathOnClient = `Files/${filename}`
 
         const links             = linkMap.get(version.ContentDocumentId) || []
         const linkedObjectNames = links.map(l => l.objectName).join(' | ') || ''
@@ -374,8 +360,8 @@ export async function POST(request) {
       }, maxConcurrent)
 
       // ── Step 5: Build CSV manifest + ZIP ──────────────────────────────
-      emit.progress(94, 'Building CSV manifest…')
-      zip.file('manifest.csv', buildManifestCSV(manifestRows))
+      emit.progress(94, 'Building file_manifest.csv…')
+      zip.file('file_manifest.csv', buildManifestCSV(manifestRows))
 
       emit.progress(97, 'Generating ZIP archive…')
 

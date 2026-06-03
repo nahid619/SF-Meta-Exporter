@@ -1,18 +1,18 @@
-// FILE PATH: app/api/content/download/[jobId]/route.js
+// FILE PATH: app/api/attachment/download/[jobId]/route.js
 import { getResult } from '@/lib/jobs/store'
 
 export const dynamic = 'force-dynamic'
 
 /**
- * GET /api/content/download/[jobId]
+ * GET /api/attachment/download/[jobId]
  *
  * Fallback download route for self-hosted deployments that use the job store.
- * On Vercel the content/export route delivers the ZIP inline via base64
+ * On Vercel the attachment/export route delivers the ZIP inline via base64
  * in the SSE done event (zipBase64) so this route is rarely hit in production.
  *
  * Serves the completed ZIP containing:
- *   Files/            ← all downloaded ContentDocument file versions
- *   file_manifest.csv ← DataLoader-compatible CSV with full metadata
+ *   Attachments/             ← all downloaded legacy attachment bodies
+ *   attachment_manifest.csv  ← DataLoader-compatible CSV with full metadata
  */
 export async function GET(request, { params }) {
   const { jobId } = await params

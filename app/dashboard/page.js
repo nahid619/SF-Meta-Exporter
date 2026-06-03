@@ -1,3 +1,4 @@
+// FILE PATH: app/dashboard/page.js
 import { getSession } from '@/lib/session'
 
 export const dynamic = 'force-dynamic'
@@ -16,7 +17,7 @@ const MODULES = [
   {
     id: 'files', icon: '📁', title: 'File Downloader', phase: 5, done: true,
     href: '/dashboard/files',
-    desc: 'Bulk-download ContentDocuments with 10 concurrent streams, ZIP output, and CSV manifest.',
+    desc: 'Bulk-download ContentDocuments and optionally legacy Attachments — concurrent streams, ZIP output, and DataLoader-compatible CSV manifests.',
   },
   {
     id: 'soql', icon: '💻', title: 'SOQL Runner', phase: 6, done: true,
@@ -43,7 +44,6 @@ const MODULES = [
 export default async function DashboardPage() {
   const session = await getSession()
   const orgLabel = { production: 'Production', sandbox: 'Sandbox', custom: 'Custom Domain' }[session.orgType] ?? 'Salesforce'
-  const liveMods = MODULES.filter(m => m.done).length
 
   return (
     <div className="dash-page-padded">
@@ -87,20 +87,6 @@ export default async function DashboardPage() {
           </a>
         ))}
       </div>
-
-      {/* Stats row */}
-      {/* <div style={{ marginTop: '28px', padding: '18px 20px', background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '16px' }}>
-        {[
-          { label: 'Modules Total', value: '6'           },
-          { label: 'Live Now',      value: String(liveMods) },
-          { label: 'Current Phase', value: '8/8'           },
-        ].map(s => (
-          <div key={s.label} style={{ textAlign: 'center' }}>
-            <div style={{ fontSize: '26px', fontWeight: 600, color: 'var(--text-1)', fontFamily: 'var(--font-mono)' }}>{s.value}</div>
-            <div style={{ fontSize: '11.5px', color: 'var(--text-3)', marginTop: '3px' }}>{s.label}</div>
-          </div>
-        ))}
-      </div> */}
     </div>
   )
 }

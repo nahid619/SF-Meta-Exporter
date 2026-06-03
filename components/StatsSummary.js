@@ -1,3 +1,4 @@
+// FILE PATH: components/StatsSummary.js
 // components/StatsSummary.js
 
 'use client'
@@ -45,6 +46,9 @@ const FIELD_CONFIG = {
   // Restore stats (module 7)
   totalRecordsInserted:  { label: 'Records inserted',         color: 'green' },
   totalRecordsFailed:    { label: 'Records failed',           color: 'red'   },
+
+  // Attachment stats (legacy Attachment SObject)
+  totalAttachments:      { label: 'Attachments found',        color: null    },
 }
 
 function formatValue(key, val) {
