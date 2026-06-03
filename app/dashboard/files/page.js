@@ -1,11 +1,10 @@
 'use client'
 
-import { useState } from 'react'
-import ExportButton   from '@/components/ExportButton'
-import ProgressBar    from '@/components/ProgressBar'
-import DownloadButton from '@/components/DownloadButton'
-import StatsSummary   from '@/components/StatsSummary'
-import { useExport }  from '@/hooks/useExport'
+import { useState }     from 'react'
+import ExportButton     from '@/components/ExportButton'
+import ProgressBar      from '@/components/ProgressBar'
+import StatsSummary     from '@/components/StatsSummary'
+import { useExport }    from '@/hooks/useExport'
 
 export default function FileDownloaderPage() {
   const [latestOnly,    setLatestOnly]    = useState(false)
@@ -18,6 +17,26 @@ export default function FileDownloaderPage() {
   }
 
   const hasActivity = isRunning || progress || downloadUrl || error
+
+  // ── Triggered when the SSE done event carries a zipBase64 payload ──────────
+  // useExport sets downloadUrl to the base64 string when the done event has
+  // zipBase64 instead of a URL. We detect this by checking for the data: prefix.
+  function handleInlineDownload() {
+    if (!downloadUrl) return
+    try {
+      // downloadUrl is either a normal '/api/...' path OR a base64 data URI
+      const isBase64 = downloadUrl.startsWith('data:')
+      const href     = isBase64 ? downloadUrl : downloadUrl
+      const a        = document.createElement('a')
+      a.href         = href
+      a.download     = stats?._filename || 'ContentDocument_Export.zip'
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+    } catch (err) {
+      alert(`Download error: ${err.message}`)
+    }
+  }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
@@ -228,12 +247,40 @@ export default function FileDownloaderPage() {
               <div className="form-error" style={{ marginBottom: '12px' }}>⚠ {error}</div>
             )}
 
-            {/* Results */}
+            {/* Results — download button triggers inline base64 download */}
             {!isRunning && downloadUrl && (
               <>
                 <ProgressBar progress={progress} isRunning={false} />
                 <StatsSummary stats={stats} title="Download Summary" />
-                <DownloadButton url={downloadUrl} label="Download ZIP Archive" />
+                <button
+                  type="button"
+                  onClick={handleInlineDownload}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: '8px',
+                    width: '100%',
+                    marginTop: '12px',
+                    padding: '12px',
+                    background: 'var(--green-dim)',
+                    border: '1px solid var(--green)',
+                    borderRadius: 'var(--radius-sm)',
+                    color: '#6ee7b7',
+                    fontSize: '14px',
+                    fontWeight: 500,
+                    fontFamily: 'var(--font-outfit)',
+                    cursor: 'pointer',
+                    transition: 'background 0.2s',
+                  }}
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                    <polyline points="7 10 12 15 17 10"/>
+                    <line x1="12" y1="15" x2="12" y2="3"/>
+                  </svg>
+                  Download ZIP Archive
+                </button>
                 <p style={{ marginTop: '8px', fontSize: '11.5px', color: '#8b949e', textAlign: 'center' }}>
                   ZIP contains <code style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent-hi)' }}>Documents/</code> folder + <code style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent-hi)' }}>manifest.csv</code>
                 </p>
