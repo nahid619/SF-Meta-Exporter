@@ -8,7 +8,8 @@
  *   2. Query ContentVersions in batches of 200 document IDs
  *   3. Download all versions concurrently (default: 10 at a time)
  *   4. Pack into ZIP: Documents/{sanitised_filename} + manifest.csv
- *   5. Store ZIP in job store → emit done with download URL
+ *   5. Base64-encode the ZIP and emit it directly in the SSE done event
+ *      (avoids Vercel multi-instance job-store miss on the download request)
  *
  * Body: {
  *   latestOnly?:    boolean   — download only IsLatest=true (default: false → all versions)
@@ -17,11 +18,10 @@
  */
 
 import JSZip from 'jszip'
-import { getSession } from '@/lib/session'
+import { getSession }    from '@/lib/session'
 import { SalesforceClient } from '@/lib/salesforce/client'
-import { createSSEStream } from '@/lib/streaming/sse'
-import { generateJobId, storeResult } from '@/lib/jobs/store'
-import { rowsToCSV } from '@/lib/files/csv'
+import { createSSEStream }  from '@/lib/streaming/sse'
+import { rowsToCSV }        from '@/lib/files/csv'
 import { createContentDocStats } from '@/lib/models'
 import { formatRuntime, makeTimestamp } from '@/lib/config'
 import { checkRateLimit, rateLimitResponse, EXPORT_LIMIT } from '@/lib/rateLimit'
@@ -47,10 +47,6 @@ function buildFilename(title, docId, versionNumber, fileExtension) {
 
 // ── Salesforce queries ────────────────────────────────────────────────────────
 
-/**
- * Query ALL ContentDocuments with all fields needed for the CSV manifest.
- * Mirrors _query_content_documents() in content_document_exporter.py.
- */
 async function queryContentDocuments(client) {
   const soql = `
     SELECT Id, Title, FileExtension, FileType, ContentSize,
@@ -64,13 +60,6 @@ async function queryContentDocuments(client) {
   return records
 }
 
-/**
- * Query ContentVersions for a list of document IDs.
- * Chunks into groups of 200 to stay within SOQL IN-clause limits.
- * Mirrors _query_all_versions() but batched for efficiency.
- *
- * @param {boolean} latestOnly — true = only IsLatest versions
- */
 async function queryVersions(client, docIds, latestOnly) {
   const CHUNK = 200
   const all   = []
@@ -97,11 +86,6 @@ async function queryVersions(client, docIds, latestOnly) {
 
 // ── Concurrent download pool ──────────────────────────────────────────────────
 
-/**
- * Run `processItem` on every item in `items`, at most `maxConcurrent` at a time.
- * Mirrors Python's ThreadPoolExecutor(max_workers=10) pattern exactly.
- * JavaScript is single-threaded so there are no race conditions on queue.shift().
- */
 async function downloadWithConcurrency(items, processItem, maxConcurrent = 10) {
   if (!items.length) return []
 
@@ -121,14 +105,6 @@ async function downloadWithConcurrency(items, processItem, maxConcurrent = 10) {
   return results
 }
 
-/**
- * Download a single ContentVersion binary with retry.
- * The VersionData field from SOQL is a URL path like
- *   /services/data/v64.0/sobjects/ContentVersion/{Id}/VersionData
- * We fetch it with the stored access token.
- *
- * Mirrors requests.get(download_url, headers=self.headers) with a 120s timeout.
- */
 async function downloadVersionFile(client, version, maxAttempts = 3) {
   const url = `${client.instanceUrl}${version.VersionData}`
 
@@ -142,7 +118,6 @@ async function downloadVersionFile(client, version, maxAttempts = 3) {
       return Buffer.from(await res.arrayBuffer())
     } catch (err) {
       if (attempt === maxAttempts) throw err
-      // Exponential back-off: 1s, 2s
       await new Promise(r => setTimeout(r, 1000 * attempt))
     }
   }
@@ -150,7 +125,6 @@ async function downloadVersionFile(client, version, maxAttempts = 3) {
 
 // ── CSV manifest ──────────────────────────────────────────────────────────────
 
-// Column headers — DataLoader-compatible, matches Python exactly
 const CSV_HEADERS = [
   'Title',
   'PathOnClient',
@@ -176,9 +150,9 @@ function buildManifestCSV(versionRows) {
     r.docTitle,
     r.pathOnClient,
     r.docId,
-    '',                    // FirstPublishLocationId — user fills in for DataLoader re-import
+    '',
     r.docDescription || '',
-    'H',                   // Origin 'H' = uploaded file (matches Python)
+    'H',
     String(r.versionNumber),
     r.isLatest ? 'TRUE' : 'FALSE',
     String(r.totalVersions),
@@ -215,7 +189,6 @@ export async function POST(request) {
   ;(async () => {
     try {
       const client  = SalesforceClient.fromSession(session)
-      const jobId   = generateJobId()
       const startMs = Date.now()
       const stats   = createContentDocStats()
 
@@ -229,19 +202,17 @@ export async function POST(request) {
 
       if (docs.length === 0) {
         emit.warn('No ContentDocuments found in this org.')
-        // Store empty zip with empty CSV
         const zip = new JSZip()
         zip.file('manifest.csv', rowsToCSV(CSV_HEADERS, []))
         const buf = await zip.generateAsync({ type: 'nodebuffer' })
-        const jid = generateJobId()
-        storeResult(jid, { buffer: buf, filename: `ContentDocument_Export_${makeTimestamp()}.zip`, contentType: 'application/zip' })
-        emit.done(`/api/content/download/${jid}`, stats)
+        const b64 = buf.toString('base64')
+        const filename = `ContentDocument_Export_${makeTimestamp()}.zip`
+        emit.data({ type: 'done', zipBase64: b64, filename, stats })
         return
       }
 
       emit.success(`Found ${docs.length} ContentDocument record(s)`)
 
-      // Build doc lookup map
       const docMap = new Map(docs.map(d => [d.Id, d]))
 
       // ── Step 2: Query ContentVersions ───────────────────────────────────
@@ -252,7 +223,6 @@ export async function POST(request) {
       stats.totalVersions = versions.length
       emit.success(`Found ${versions.length} version(s) to download`)
 
-      // Count total versions per document (for CSV column)
       const totalVersionsByDoc = new Map()
       for (const v of versions) {
         totalVersionsByDoc.set(v.ContentDocumentId, (totalVersionsByDoc.get(v.ContentDocumentId) || 0) + 1)
@@ -264,7 +234,7 @@ export async function POST(request) {
       const zip          = new JSZip()
       const docsFolder   = zip.folder('Documents')
       const manifestRows = []
-      let   dlCount      = 0  // completed (success + fail)
+      let   dlCount      = 0
 
       await downloadWithConcurrency(versions, async (version) => {
         const doc          = docMap.get(version.ContentDocumentId)
@@ -331,13 +301,13 @@ export async function POST(request) {
         compressionOptions: { level: 6 },
       })
 
-      storeResult(jobId, {
-        buffer:      zipBuffer,
-        filename:    `ContentDocument_Export_${makeTimestamp()}.zip`,
-        contentType: 'application/zip',
-      })
+      // Encode ZIP as base64 and send it directly in the SSE stream.
+      // This avoids the Vercel multi-instance job-store miss: no second
+      // GET request is needed — the client reconstructs the file in-browser.
+      const zipBase64  = zipBuffer.toString('base64')
+      const filename   = `ContentDocument_Export_${makeTimestamp()}.zip`
 
-      emit.done(`/api/content/download/${jobId}`, stats)
+      emit.data({ type: 'done', zipBase64, filename, stats })
       emit.success(
         `=== Done in ${stats.runtimeFormatted} — ` +
         `${stats.successfulDownloads} downloaded, ${stats.failedDownloads} failed, ` +
