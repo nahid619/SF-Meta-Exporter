@@ -7,7 +7,7 @@
       "maxDuration": 300
     },
     "app/api/content/export/route.js": {
-      "maxDuration": 60
+      "maxDuration": 300
     },
     "app/api/metadata/export/route.js": {
       "maxDuration": 60
