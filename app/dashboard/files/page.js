@@ -7,14 +7,96 @@ import ProgressBar      from '@/components/ProgressBar'
 import StatsSummary     from '@/components/StatsSummary'
 import { useExport }    from '@/hooks/useExport'
 
+// ── Filter helpers ────────────────────────────────────────────────────────────
+
+const EMPTY_FILTERS = {
+  created_from:   '',
+  created_to:     '',
+  modified_from:  '',
+  modified_to:    '',
+  file_type:      '',
+  file_extension: '',
+  title:          '',
+  is_archived:    'any',   // 'any' | 'true' | 'false'
+}
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
+
+/** Returns an error string if any filled date field is malformed, otherwise ''. */
+function validateFilters(f) {
+  const dateFields = [
+    { key: 'created_from',  label: 'Created From'   },
+    { key: 'created_to',    label: 'Created To'     },
+    { key: 'modified_from', label: 'Modified From'  },
+    { key: 'modified_to',   label: 'Modified To'    },
+  ]
+  for (const { key, label } of dateFields) {
+    if (f[key] && !DATE_RE.test(f[key])) {
+      return `${label} must be YYYY-MM-DD`
+    }
+  }
+  return ''
+}
+
+/** Count how many filters are meaningfully set (used for the badge). */
+function countActiveFilters(f) {
+  return [
+    f.created_from, f.created_to,
+    f.modified_from, f.modified_to,
+    f.file_type, f.file_extension, f.title,
+  ].filter(Boolean).length + (f.is_archived !== 'any' ? 1 : 0)
+}
+
+// ── Shared input style (keeps JSX lean) ──────────────────────────────────────
+
+const inputStyle = {
+  width:        '100%',
+  padding:      '8px 10px',
+  background:   'var(--bg-input)',
+  border:       '1px solid var(--border-hi)',
+  borderRadius: 'var(--radius-sm)',
+  color:        'var(--text-1)',
+  fontFamily:   'var(--font-mono)',
+  fontSize:     '12px',
+  outline:      'none',
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 export default function FileDownloaderPage() {
-  const [latestOnly,    setLatestOnly]    = useState(false)
-  const [maxConcurrent, setMaxConcurrent] = useState(10)
+  const [latestOnly,     setLatestOnly]     = useState(false)
+  const [maxConcurrent,  setMaxConcurrent]  = useState(10)
+
+  // filter panel
+  const [filtersOpen,    setFiltersOpen]    = useState(false)
+  const [filters,        setFilters]        = useState(EMPTY_FILTERS)
+  const [filterError,    setFilterError]    = useState('')
 
   const { isRunning, progress, downloadUrl, stats, error, startExport, cancel } = useExport()
 
+  const activeCount = countActiveFilters(filters)
+
+  function setFilter(key, value) {
+    setFilters(prev => ({ ...prev, [key]: value }))
+    setFilterError('')
+  }
+
+  function clearFilters() {
+    setFilters(EMPTY_FILTERS)
+    setFilterError('')
+  }
+
   function handleExport() {
-    startExport('/api/content/export', { latestOnly, maxConcurrent })
+    const err = validateFilters(filters)
+    if (err) { setFilterError(err); setFiltersOpen(true); return }
+
+    // Strip empty / default values before sending — mirrors Python behaviour
+    const activeFilters = {}
+    for (const [k, v] of Object.entries(filters)) {
+      if (v && v !== 'any') activeFilters[k] = v
+    }
+
+    startExport('/api/content/export', { latestOnly, maxConcurrent, filters: activeFilters })
   }
 
   const hasActivity = isRunning || progress || downloadUrl || error
@@ -31,6 +113,18 @@ export default function FileDownloaderPage() {
     } catch (err) {
       alert(`Download error: ${err.message}`)
     }
+  }
+
+  // ── Filter section label styles ───────────────────────────────────────────
+
+  const filterLabelStyle = {
+    display:       'block',
+    fontSize:      '11px',
+    fontWeight:    600,
+    color:         'var(--text-3)',
+    marginBottom:  '5px',
+    letterSpacing: '0.04em',
+    textTransform: 'uppercase',
   }
 
   return (
@@ -128,6 +222,210 @@ export default function FileDownloaderPage() {
                 <span>20 — max</span>
               </div>
             </div>
+
+            {/* ── FILTERS SECTION ───────────────────────────────────────── */}
+            <div style={{
+              background: 'var(--bg-input)',
+              border: `1px solid ${activeCount > 0 ? 'var(--accent)' : 'var(--border-hi)'}`,
+              borderRadius: 'var(--radius-sm)',
+              marginBottom: '14px',
+              overflow: 'hidden',
+              transition: 'border-color 0.15s',
+            }}>
+
+              {/* Filter toggle header */}
+              <button
+                type="button"
+                onClick={() => setFiltersOpen(o => !o)}
+                disabled={isRunning}
+                style={{
+                  width:      '100%',
+                  display:    'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  padding:    '11px 14px',
+                  background: 'transparent',
+                  border:     'none',
+                  cursor:     isRunning ? 'not-allowed' : 'pointer',
+                  color:      'var(--text-1)',
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <span style={{ fontSize: '13px' }}>🔍</span>
+                  <span style={{ fontSize: '13px', fontWeight: 500, color: '#c9d1d9' }}>Filters</span>
+                  {activeCount > 0 && (
+                    <span style={{
+                      fontSize:     '10px',
+                      fontWeight:   700,
+                      background:   'var(--accent)',
+                      color:        '#fff',
+                      borderRadius: '10px',
+                      padding:      '1px 7px',
+                    }}>
+                      {activeCount} active
+                    </span>
+                  )}
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  {activeCount > 0 && (
+                    <span
+                      role="button"
+                      tabIndex={0}
+                      onClick={e => { e.stopPropagation(); clearFilters() }}
+                      onKeyDown={e => e.key === 'Enter' && (e.stopPropagation(), clearFilters())}
+                      style={{
+                        fontSize:   '11px',
+                        color:      '#8b949e',
+                        cursor:     'pointer',
+                        padding:    '2px 6px',
+                        borderRadius: 'var(--radius-sm)',
+                        border:     '1px solid var(--border)',
+                      }}
+                    >
+                      Clear all
+                    </span>
+                  )}
+                  <span style={{ fontSize: '12px', color: 'var(--text-3)', transform: filtersOpen ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s', display: 'inline-block' }}>▾</span>
+                </div>
+              </button>
+
+              {/* Collapsible body */}
+              {filtersOpen && (
+                <div style={{ padding: '0 14px 14px', borderTop: '1px solid var(--border)' }}>
+
+                  {/* Validation error */}
+                  {filterError && (
+                    <div style={{ marginTop: '10px', padding: '8px 10px', background: 'rgba(248,81,73,0.1)', border: '1px solid rgba(248,81,73,0.4)', borderRadius: 'var(--radius-sm)', fontSize: '12px', color: '#fca5a5' }}>
+                      ⚠ {filterError}
+                    </div>
+                  )}
+
+                  {/* Created Date range */}
+                  <div style={{ marginTop: '12px' }}>
+                    <div style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-3)', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                      Created Date
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                      <div>
+                        <label style={filterLabelStyle}>From</label>
+                        <input
+                          type="date"
+                          value={filters.created_from}
+                          onChange={e => setFilter('created_from', e.target.value)}
+                          disabled={isRunning}
+                          style={inputStyle}
+                        />
+                      </div>
+                      <div>
+                        <label style={filterLabelStyle}>To</label>
+                        <input
+                          type="date"
+                          value={filters.created_to}
+                          onChange={e => setFilter('created_to', e.target.value)}
+                          disabled={isRunning}
+                          style={inputStyle}
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Last Modified Date range */}
+                  <div style={{ marginTop: '12px' }}>
+                    <div style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-3)', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                      Last Modified Date
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                      <div>
+                        <label style={filterLabelStyle}>From</label>
+                        <input
+                          type="date"
+                          value={filters.modified_from}
+                          onChange={e => setFilter('modified_from', e.target.value)}
+                          disabled={isRunning}
+                          style={inputStyle}
+                        />
+                      </div>
+                      <div>
+                        <label style={filterLabelStyle}>To</label>
+                        <input
+                          type="date"
+                          value={filters.modified_to}
+                          onChange={e => setFilter('modified_to', e.target.value)}
+                          disabled={isRunning}
+                          style={inputStyle}
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Text filters: FileType + FileExtension */}
+                  <div style={{ marginTop: '12px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                    <div>
+                      <label style={filterLabelStyle}>File Type</label>
+                      <input
+                        type="text"
+                        placeholder="e.g. PDF"
+                        value={filters.file_type}
+                        onChange={e => setFilter('file_type', e.target.value)}
+                        disabled={isRunning}
+                        className="field-input"
+                        style={{ ...inputStyle, padding: '8px 10px' }}
+                      />
+                      <div style={{ fontSize: '10.5px', color: 'var(--text-3)', marginTop: '4px' }}>Partial match (LIKE)</div>
+                    </div>
+                    <div>
+                      <label style={filterLabelStyle}>File Extension</label>
+                      <input
+                        type="text"
+                        placeholder="e.g. pdf"
+                        value={filters.file_extension}
+                        onChange={e => setFilter('file_extension', e.target.value)}
+                        disabled={isRunning}
+                        className="field-input"
+                        style={{ ...inputStyle, padding: '8px 10px' }}
+                      />
+                      <div style={{ fontSize: '10.5px', color: 'var(--text-3)', marginTop: '4px' }}>Partial match (LIKE)</div>
+                    </div>
+                  </div>
+
+                  {/* Title text filter */}
+                  <div style={{ marginTop: '12px' }}>
+                    <label style={filterLabelStyle}>Title</label>
+                    <input
+                      type="text"
+                      placeholder="e.g. Invoice"
+                      value={filters.title}
+                      onChange={e => setFilter('title', e.target.value)}
+                      disabled={isRunning}
+                      className="field-input"
+                      style={{ ...inputStyle, padding: '8px 10px' }}
+                    />
+                    <div style={{ fontSize: '10.5px', color: 'var(--text-3)', marginTop: '4px' }}>Partial match — searches ContentDocument.Title</div>
+                  </div>
+
+                  {/* IsArchived dropdown */}
+                  <div style={{ marginTop: '12px' }}>
+                    <label style={filterLabelStyle}>IsArchived</label>
+                    <select
+                      value={filters.is_archived}
+                      onChange={e => setFilter('is_archived', e.target.value)}
+                      disabled={isRunning}
+                      style={{
+                        ...inputStyle,
+                        padding: '8px 10px',
+                        cursor:  isRunning ? 'not-allowed' : 'pointer',
+                      }}
+                    >
+                      <option value="any">Any</option>
+                      <option value="true">Archived only</option>
+                      <option value="false">Not archived</option>
+                    </select>
+                  </div>
+
+                </div>
+              )}
+            </div>
+            {/* ── END FILTERS SECTION ───────────────────────────────────── */}
 
             {/* Output info */}
             <div style={{
