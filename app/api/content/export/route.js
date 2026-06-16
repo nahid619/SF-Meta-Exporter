@@ -3,16 +3,20 @@
  * POST /api/content/export
  *
  * Flow:
- *   1. Query all ContentDocuments (paginated), applying any caller-supplied filters
- *   2. Query ContentVersions in batches of 200 document IDs
- *   3. Query ContentDocumentLink — resolves which SF object/record each file
+ *   1. (Optional) Resolve object-type restriction: for each selected object
+ *      API name, semi-join ContentDocumentLink → SObject.Id to get the set
+ *      of ContentDocumentIds linked to that object, then union the sets.
+ *   2. Query all ContentDocuments (paginated), applying caller-supplied
+ *      field filters AND the object-type restriction (Id IN batches of 400)
+ *   3. Query ContentVersions in batches of 200 document IDs
+ *   4. Query ContentDocumentLink — resolves which SF object/record each file
  *      is attached to. A file can link to multiple records, so values are
  *      pipe-separated in the CSV columns.
- *   4. Download all versions concurrently (default: 10 at a time)
- *   5. Pack into ZIP:
+ *   5. Download all versions concurrently (default: 10 at a time)
+ *   6. Pack into ZIP:
  *        Files/{sanitised_filename}   — the actual files
  *        file_manifest.csv            — RFC 4180 CSV, opens cleanly in Excel
- *   6. Base64-encode the ZIP and emit it directly in the SSE done event
+ *   7. Base64-encode the ZIP and emit it directly in the SSE done event
  *      (avoids Vercel multi-instance job-store miss on the download request)
  *
  * file_manifest.csv columns (new columns marked ★):
@@ -27,6 +31,10 @@
  * Body: {
  *   latestOnly?:    boolean  — download only IsLatest=true (default: false)
  *   maxConcurrent?: number   — parallel downloads, default 10
+ *   objectTypes?:   string[] — only download files linked to a record of one
+ *                              of these SObjects, e.g. ['Account', 'Case'].
+ *                              Resolved via a ContentDocumentLink semi-join
+ *                              since ContentDocument has no Parent/Type field.
  *   filters?: {
  *     created_from?:   string  — YYYY-MM-DD, maps to CreatedDate >=
  *     created_to?:     string  — YYYY-MM-DD, maps to CreatedDate <=
@@ -122,19 +130,98 @@ function buildWhereClause(filters = {}) {
 
 // ── Salesforce queries ────────────────────────────────────────────────────────
 
-async function queryContentDocuments(client, filters = {}) {
-  const where = buildWhereClause(filters)
-  const soql  = `
+// Max ContentDocument Ids per "Id IN (...)" SOQL clause — keeps the query
+// string comfortably under Salesforce's 20,000-character SOQL limit, even
+// combined with the other field filters (date ranges, LIKE clauses, etc.).
+const ID_CHUNK_SIZE = 400
+
+function chunkArray(items, size) {
+  const chunks = []
+  for (let i = 0; i < items.length; i += size) chunks.push(items.slice(i, i + size))
+  return chunks
+}
+
+/** Combine an existing 'WHERE ...' clause (or '') with one more bare condition. */
+function combineWhere(baseWhere, extraCondition) {
+  return baseWhere ? `${baseWhere} AND ${extraCondition}` : `WHERE ${extraCondition}`
+}
+
+function buildContentDocumentQuery(whereClause) {
+  return `
     SELECT Id, Title, FileExtension, FileType, ContentSize,
            CreatedDate, LastModifiedDate, OwnerId, ParentId,
            IsArchived, Description, PublishStatus,
            LatestPublishedVersionId
     FROM ContentDocument
-    ${where}
+    ${whereClause}
     ORDER BY CreatedDate DESC
   `
-  const { records } = await client.queryAll(soql)
-  return records
+}
+
+/**
+ * Resolve the ContentDocumentIds linked to any record of `objectType`.
+ *
+ * Salesforce Files don't carry a Parent/Type field the way legacy
+ * Attachments do — the link lives on ContentDocumentLink.LinkedEntityId,
+ * a polymorphic field that can't be filtered by LinkedEntity.Type directly.
+ * The standard workaround is a semi-join scoping LinkedEntityId to the
+ * target object's own Id space:
+ *
+ *   SELECT ContentDocumentId FROM ContentDocumentLink
+ *   WHERE LinkedEntityId IN (SELECT Id FROM {objectType})
+ */
+async function queryLinkedDocumentIds(client, objectType) {
+  // objectType is expected to come from the org's own describeGlobal() list
+  // (see /api/objects), but since it's interpolated directly into the FROM
+  // clause — not a quoted literal — we still validate its shape defensively.
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(objectType)) {
+    console.warn('[content/export] Skipping invalid object type:', objectType)
+    return new Set()
+  }
+  try {
+    const soql = `
+      SELECT ContentDocumentId
+      FROM ContentDocumentLink
+      WHERE LinkedEntityId IN (SELECT Id FROM ${objectType})
+    `
+    const { records } = await client.queryAll(soql)
+    return new Set(records.map(r => r.ContentDocumentId))
+  } catch (err) {
+    console.warn(`[content/export] ContentDocumentLink query failed for ${objectType}:`, err.message)
+    return new Set()
+  }
+}
+
+/**
+ * Query ContentDocument records, optionally narrowed by field filters and/or
+ * restricted to a specific set of Ids (the linked-object filter resolves to
+ * this set before this function ever runs).
+ */
+async function queryContentDocuments(client, filters = {}, restrictToIds = null) {
+  // An empty (but non-null) restriction means the object filter matched
+  // nothing — short-circuit instead of issuing a query that would also
+  // return nothing.
+  if (restrictToIds !== null && restrictToIds.size === 0) return []
+
+  const baseWhere = buildWhereClause(filters)
+
+  if (!restrictToIds) {
+    const soql = buildContentDocumentQuery(baseWhere)
+    const { records } = await client.queryAll(soql)
+    return records
+  }
+
+  // Batch the Id list so each "Id IN (...)" clause stays well under
+  // Salesforce's SOQL length limit, then merge the batched results.
+  const allRecords = []
+  for (const batch of chunkArray([...restrictToIds].sort(), ID_CHUNK_SIZE)) {
+    const idClause    = `Id IN (${batch.map(id => `'${id}'`).join(',')})`
+    const whereClause = combineWhere(baseWhere, idClause)
+    const soql        = buildContentDocumentQuery(whereClause)
+    const { records } = await client.queryAll(soql)
+    allRecords.push(...records)
+  }
+  return allRecords
 }
 
 async function queryVersions(client, docIds, latestOnly) {
@@ -312,6 +399,7 @@ export async function POST(request) {
     latestOnly    = false,
     maxConcurrent = 10,
     filters       = {},
+    objectTypes   = [],
   } = await request.json()
 
   const session = await getSession()
@@ -330,19 +418,39 @@ export async function POST(request) {
       const startMs = Date.now()
       const stats   = createContentDocStats()
 
-      // ── Step 1: Query ContentDocuments ────────────────────────────────
+      // ── Step 1: Resolve object-type restriction (if any) ──────────────
       emit.info('=== ContentDocument File Downloader ===')
       emit.info(`Mode: ${latestOnly ? 'Latest version only' : 'All versions'} | Concurrency: ${maxConcurrent}`)
 
       const filterDesc = describeFilters(filters)
       emit.info(`Filters: ${filterDesc}`)
+
+      let restrictToIds = null
+      if (objectTypes.length > 0) {
+        emit.info(`Filtering by linked object type(s): ${objectTypes.join(', ')}`)
+        emit.progress(2, 'Resolving object filter…')
+
+        restrictToIds = new Set()
+        for (const objType of objectTypes) {
+          const linkedIds = await queryLinkedDocumentIds(client, objType)
+          emit.info(`  ${objType}: ${linkedIds.size} linked document(s)`)
+          for (const id of linkedIds) restrictToIds.add(id)
+        }
+        stats.objectTypesFiltered = objectTypes
+      }
+
+      // ── Step 2: Query ContentDocuments ─────────────────────────────────
       emit.info('Querying ContentDocument records…')
 
-      const docs = await queryContentDocuments(client, filters)
+      const docs = await queryContentDocuments(client, filters, restrictToIds)
       stats.totalDocuments = docs.length
 
       if (docs.length === 0) {
-        emit.warn('No ContentDocuments found matching the current filters.')
+        if (restrictToIds !== null && restrictToIds.size === 0) {
+          emit.warn('No documents are linked to the selected object type(s).')
+        } else {
+          emit.warn('No ContentDocuments found matching the current filters.')
+        }
         const zip      = new JSZip()
         zip.file('file_manifest.csv', rowsToCSV(CSV_HEADERS, []))
         const buf      = await zip.generateAsync({ type: 'nodebuffer' })
@@ -356,7 +464,7 @@ export async function POST(request) {
       const docIds = docs.map(d => d.Id)
       const docMap = new Map(docs.map(d => [d.Id, d]))
 
-      // ── Step 2: Query ContentVersions ─────────────────────────────────
+      // ── Step 3: Query ContentVersions ─────────────────────────────────
       emit.info(`Fetching ${latestOnly ? 'latest' : 'all'} versions…`)
       emit.progress(5, 'Querying versions…')
 
@@ -369,7 +477,7 @@ export async function POST(request) {
         totalVersionsByDoc.set(v.ContentDocumentId, (totalVersionsByDoc.get(v.ContentDocumentId) || 0) + 1)
       }
 
-      // ── Step 3: Query ContentDocumentLink ─────────────────────────────
+      // ── Step 4: Query ContentDocumentLink ─────────────────────────────
       emit.info('Resolving object linkage via ContentDocumentLink…')
       emit.progress(8, 'Querying object links…')
 
@@ -385,7 +493,7 @@ export async function POST(request) {
         emit.warn('No ContentDocumentLink records found — LinkedObjectNames will be empty.')
       }
 
-      // ── Step 4: Concurrent downloads ──────────────────────────────────
+      // ── Step 5: Concurrent downloads ──────────────────────────────────
       emit.info(`Starting ${maxConcurrent}-concurrent downloads…`)
 
       const zip          = new JSZip()
@@ -451,7 +559,7 @@ export async function POST(request) {
         }
       }, maxConcurrent)
 
-      // ── Step 5: Build CSV manifest + ZIP ──────────────────────────────
+      // ── Step 6: Build CSV manifest + ZIP ──────────────────────────────
       emit.progress(94, 'Building file_manifest.csv…')
       zip.file('file_manifest.csv', buildManifestCSV(manifestRows))
 
