@@ -169,9 +169,9 @@ export default function FileDownloaderPage() {
       {/* ── 3-PANEL MAIN AREA (40% / 30% / 30%) ── */}
       <div style={{ flex: 1, display: 'flex', minHeight: 0, overflow: 'hidden' }}>
 
-        {/* ── PANEL 1: Object filter (40%) ── */}
+        {/* ── PANEL 1: Object filter (30%) ── */}
         <div style={{
-          width: '40%', display: 'flex', flexDirection: 'column', minHeight: 0,
+          width: '30%', display: 'flex', flexDirection: 'column', minHeight: 0,
           borderRight: '1px solid var(--border)',
         }}>
           <div style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
@@ -199,9 +199,9 @@ export default function FileDownloaderPage() {
           </div>
         </div>
 
-        {/* ── PANEL 2: Filters & options (30%) ── */}
+        {/* ── PANEL 2: Filters & options (35%) ── */}
         <div style={{
-          width: '30%', display: 'flex', flexDirection: 'column', minHeight: 0,
+          width: '35%', display: 'flex', flexDirection: 'column', minHeight: 0,
           borderRight: '1px solid var(--border)',
         }}>
           <div style={{
@@ -523,8 +523,8 @@ export default function FileDownloaderPage() {
           </div>
         </div>
 
-        {/* ── PANEL 3: Progress & results (30%) ── */}
-        <div style={{ width: '30%', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+        {/* ── PANEL 3: Progress & results (35%) ── */}
+        <div style={{ width: '35%', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
           <div style={{
             flexShrink: 0, padding: '12px 16px',
             borderBottom: '1px solid var(--border)', background: 'var(--bg-card)',
