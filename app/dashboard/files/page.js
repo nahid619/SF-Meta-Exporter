@@ -68,13 +68,13 @@ export default function FileDownloaderPage() {
   const [maxConcurrent,  setMaxConcurrent]  = useState(10)
 
   // filter panel
-  const [filtersOpen,    setFiltersOpen]    = useState(false)
+  const [filtersOpen,    setFiltersOpen]    = useState(true)
   const [filters,        setFilters]        = useState(EMPTY_FILTERS)
   const [filterError,    setFilterError]    = useState('')
 
   const { isRunning, progress, downloadUrl, stats, error, startExport, cancel } = useExport()
 
-  const activeCount = countActiveFilters(filters)
+  const activeCount = countActiveFilters(filters) + (latestOnly ? 1 : 0)
 
   function setFilter(key, value) {
     setFilters(prev => ({ ...prev, [key]: value }))
@@ -83,6 +83,7 @@ export default function FileDownloaderPage() {
 
   function clearFilters() {
     setFilters(EMPTY_FILTERS)
+    setLatestOnly(false)
     setFilterError('')
   }
 
@@ -172,30 +173,6 @@ export default function FileDownloaderPage() {
           </div>
 
           <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '16px' }}>
-
-            {/* Latest-only toggle */}
-            <label style={{
-              display: 'flex', alignItems: 'flex-start', gap: '10px',
-              padding: '12px 14px', marginBottom: '12px',
-              background: 'var(--bg-input)',
-              border: `1px solid ${latestOnly ? 'var(--accent)' : 'var(--border-hi)'}`,
-              borderRadius: 'var(--radius-sm)',
-              cursor: isRunning ? 'not-allowed' : 'pointer',
-              transition: 'border-color 0.15s',
-            }}>
-              <input
-                type="checkbox" checked={latestOnly}
-                onChange={e => setLatestOnly(e.target.checked)}
-                disabled={isRunning}
-                style={{ marginTop: '2px', accentColor: 'var(--accent)', flexShrink: 0 }}
-              />
-              <div>
-                <div style={{ fontSize: '13px', color: '#c9d1d9', fontWeight: 500 }}>Latest version only</div>
-                <div style={{ fontSize: '11.5px', color: '#8b949e', marginTop: '3px', lineHeight: 1.5 }}>
-                  Download only the most recent version of each file. Faster and produces a smaller ZIP.
-                </div>
-              </div>
-            </label>
 
             {/* Concurrency slider */}
             <div style={{
@@ -292,6 +269,30 @@ export default function FileDownloaderPage() {
               {/* Collapsible body */}
               {filtersOpen && (
                 <div style={{ padding: '0 14px 14px', borderTop: '1px solid var(--border)' }}>
+
+                  {/* Latest version only — moved here so all filters live together */}
+                  <label style={{
+                    display: 'flex', alignItems: 'flex-start', gap: '10px',
+                    padding: '10px 12px', marginTop: '12px',
+                    background: 'var(--bg-card)',
+                    border: `1px solid ${latestOnly ? 'var(--accent)' : 'var(--border)'}`,
+                    borderRadius: 'var(--radius-sm)',
+                    cursor: isRunning ? 'not-allowed' : 'pointer',
+                    transition: 'border-color 0.15s',
+                  }}>
+                    <input
+                      type="checkbox" checked={latestOnly}
+                      onChange={e => setLatestOnly(e.target.checked)}
+                      disabled={isRunning}
+                      style={{ marginTop: '2px', accentColor: 'var(--accent)', flexShrink: 0 }}
+                    />
+                    <div>
+                      <div style={{ fontSize: '12.5px', color: '#c9d1d9', fontWeight: 500 }}>Latest version only</div>
+                      <div style={{ fontSize: '11px', color: '#8b949e', marginTop: '2px', lineHeight: 1.5 }}>
+                        Download only the most recent version of each file. Faster and smaller ZIP.
+                      </div>
+                    </div>
+                  </label>
 
                   {/* Validation error */}
                   {filterError && (
