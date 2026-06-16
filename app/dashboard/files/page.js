@@ -2,6 +2,7 @@
 'use client'
 
 import { useState }     from 'react'
+import ObjectSelector   from '@/components/ObjectSelector'
 import ExportButton     from '@/components/ExportButton'
 import ProgressBar      from '@/components/ProgressBar'
 import StatsSummary     from '@/components/StatsSummary'
@@ -38,7 +39,7 @@ function validateFilters(f) {
   return ''
 }
 
-/** Count how many filters are meaningfully set (used for the badge). */
+/** Count how many field filters are meaningfully set (used for the badge). */
 function countActiveFilters(f) {
   return [
     f.created_from, f.created_to,
@@ -61,13 +62,26 @@ const inputStyle = {
   outline:      'none',
 }
 
+const filterLabelStyle = {
+  display:       'block',
+  fontSize:      '11px',
+  fontWeight:    600,
+  color:         'var(--text-3)',
+  marginBottom:  '5px',
+  letterSpacing: '0.04em',
+  textTransform: 'uppercase',
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 export default function FileDownloaderPage() {
+  // Object-based filter (Panel 1) — restricts to files linked to a record
+  // of one of these SObjects. Optional: empty array = no restriction.
+  const [selectedObjects, setSelectedObjects] = useState([])
+
+  // Field filters + options (Panel 2)
   const [latestOnly,     setLatestOnly]     = useState(false)
   const [maxConcurrent,  setMaxConcurrent]  = useState(10)
-
-  // filter panel
   const [filtersOpen,    setFiltersOpen]    = useState(true)
   const [filters,        setFilters]        = useState(EMPTY_FILTERS)
   const [filterError,    setFilterError]    = useState('')
@@ -97,7 +111,12 @@ export default function FileDownloaderPage() {
       if (v && v !== 'any') activeFilters[k] = v
     }
 
-    startExport('/api/content/export', { latestOnly, maxConcurrent, filters: activeFilters })
+    startExport('/api/content/export', {
+      latestOnly,
+      maxConcurrent,
+      filters: activeFilters,
+      objectTypes: selectedObjects,
+    })
   }
 
   const hasActivity = isRunning || progress || downloadUrl || error
@@ -116,17 +135,9 @@ export default function FileDownloaderPage() {
     }
   }
 
-  // ── Filter section label styles ───────────────────────────────────────────
-
-  const filterLabelStyle = {
-    display:       'block',
-    fontSize:      '11px',
-    fontWeight:    600,
-    color:         'var(--text-3)',
-    marginBottom:  '5px',
-    letterSpacing: '0.04em',
-    textTransform: 'uppercase',
-  }
+  const scopeSummary = (selectedObjects.length > 0 || activeCount > 0)
+    ? `${selectedObjects.length} object${selectedObjects.length !== 1 ? 's' : ''} · ${activeCount} filter${activeCount !== 1 ? 's' : ''} active`
+    : 'No restrictions — exports entire org\u2019s Files'
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
@@ -148,19 +159,49 @@ export default function FileDownloaderPage() {
           background: 'linear-gradient(to bottom, transparent, var(--accent), transparent)',
           boxShadow: '0 0 8px var(--accent)',
         }} />
-        <p style={{ fontSize: '12px', color: 'var(--text-3)', lineHeight: 1.55, maxWidth: '560px' }}>
-          Bulk-download all ContentDocuments from your org. Files are packed into a
-          ZIP archive with a DataLoader-compatible <code style={{ fontFamily: 'var(--font-mono)', fontSize: '11px' }}>file_manifest.csv</code>.
-          Supports all versions or latest-only with configurable concurrency.
+        <p style={{ fontSize: '12px', color: 'var(--text-3)', lineHeight: 1.55, maxWidth: '620px' }}>
+          Bulk-download all ContentDocuments from your org. Optionally restrict to files linked
+          to specific objects, narrow by date/type/title, then pack into a ZIP with a
+          DataLoader-compatible <code style={{ fontFamily: 'var(--font-mono)', fontSize: '11px' }}>file_manifest.csv</code>.
         </p>
       </div>
 
-      {/* ── 2-PANEL MAIN AREA ── */}
+      {/* ── 3-PANEL MAIN AREA (40% / 30% / 30%) ── */}
       <div style={{ flex: 1, display: 'flex', minHeight: 0, overflow: 'hidden' }}>
 
-        {/* ── LEFT PANEL: Options (50%) ── */}
+        {/* ── PANEL 1: Object filter (40%) ── */}
         <div style={{
-          width: '50%', display: 'flex', flexDirection: 'column', minHeight: 0,
+          width: '40%', display: 'flex', flexDirection: 'column', minHeight: 0,
+          borderRight: '1px solid var(--border)',
+        }}>
+          <div style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
+            <ObjectSelector
+              selected={selectedObjects}
+              onChange={setSelectedObjects}
+              disabled={isRunning}
+              fillHeight
+            />
+          </div>
+
+          {/* Footer note clarifying this filter is optional (unlike Attachments) */}
+          <div style={{
+            flexShrink: 0, padding: '10px 14px',
+            borderTop: '1px solid var(--border)', background: 'var(--bg-card)',
+            fontSize: '11.5px', color: 'var(--text-3)', lineHeight: 1.5,
+          }}>
+            {selectedObjects.length > 0 ? (
+              <span>
+                Only files linked to a <strong style={{ color: '#c9d1d9' }}>{selectedObjects.join(', ')}</strong> record will be downloaded.
+              </span>
+            ) : (
+              <span>Optional — leave empty to include files linked to any (or no) object.</span>
+            )}
+          </div>
+        </div>
+
+        {/* ── PANEL 2: Filters & options (30%) ── */}
+        <div style={{
+          width: '30%', display: 'flex', flexDirection: 'column', minHeight: 0,
           borderRight: '1px solid var(--border)',
         }}>
           <div style={{
@@ -168,7 +209,7 @@ export default function FileDownloaderPage() {
             borderBottom: '1px solid var(--border)', background: 'var(--bg-card)',
           }}>
             <span style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--text-3)' }}>
-              Download Options
+              Filters &amp; Options
             </span>
           </div>
 
@@ -270,7 +311,7 @@ export default function FileDownloaderPage() {
               {filtersOpen && (
                 <div style={{ padding: '0 14px 14px', borderTop: '1px solid var(--border)' }}>
 
-                  {/* Latest version only — moved here so all filters live together */}
+                  {/* Latest version only — lives here since it's a filter too */}
                   <label style={{
                     display: 'flex', alignItems: 'flex-start', gap: '10px',
                     padding: '10px 12px', marginTop: '12px',
@@ -449,7 +490,7 @@ export default function FileDownloaderPage() {
             }}>
               {[
                 { icon: '📋', label: 'Filename format', val: '{Title}_{DocId}_v{Version}.{ext}' },
-                { icon: '🔄', label: 'Retry',           val: '3 attempts with back-off per file' },
+                { icon: '🔗', label: 'Object filter',   val: 'via ContentDocumentLink semi-join' },
                 { icon: '📊', label: 'CSV columns',     val: 'Title, DocId, Version, LinkedObjects, Size…' },
                 { icon: '⚠',  label: 'Large orgs',      val: '>500 MB may need chunked exports' },
               ].map(item => (
@@ -464,11 +505,14 @@ export default function FileDownloaderPage() {
             </div>
           </div>
 
-          {/* Export button pinned to bottom */}
+          {/* Scope summary + Export button pinned to bottom */}
           <div style={{
             flexShrink: 0, padding: '14px 16px',
             borderTop: '1px solid var(--border)', background: 'var(--bg-card)',
           }}>
+            <p style={{ marginBottom: '8px', fontSize: '11.5px', color: 'var(--text-3)', textAlign: 'center' }}>
+              {scopeSummary}
+            </p>
             <ExportButton
               onClick={handleExport}
               isRunning={isRunning}
@@ -479,8 +523,8 @@ export default function FileDownloaderPage() {
           </div>
         </div>
 
-        {/* ── RIGHT PANEL: Progress & Results (50%) ── */}
-        <div style={{ width: '50%', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+        {/* ── PANEL 3: Progress & results (30%) ── */}
+        <div style={{ width: '30%', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
           <div style={{
             flexShrink: 0, padding: '12px 16px',
             borderBottom: '1px solid var(--border)', background: 'var(--bg-card)',
@@ -503,7 +547,7 @@ export default function FileDownloaderPage() {
             {!hasActivity && (
               <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', gap: '12px', textAlign: 'center' }}>
                 <span style={{ fontSize: '40px' }}>📁</span>
-                <p style={{ fontSize: '13px', color: '#c9d1d9', lineHeight: 1.6, maxWidth: '280px' }}>
+                <p style={{ fontSize: '13px', color: '#c9d1d9', lineHeight: 1.6, maxWidth: '260px' }}>
                   Configure options on the left and click <strong>Start Download</strong> to begin.
                   Per-file progress streams here in real time.
                 </p>
@@ -514,6 +558,13 @@ export default function FileDownloaderPage() {
             {(isRunning || progress) && (
               <div style={{ marginBottom: '16px' }}>
                 <ProgressBar progress={progress} isRunning={isRunning} />
+
+                {stats?.objectTypesFiltered?.length > 0 && (
+                  <div style={{ marginTop: '10px', fontSize: '11.5px', color: 'var(--text-3)' }}>
+                    🔗 Object filter: <strong style={{ color: '#c9d1d9' }}>{stats.objectTypesFiltered.join(', ')}</strong>
+                  </div>
+                )}
+
                 {stats?.successfulDownloads != null && (
                   <div style={{ marginTop: '14px', display: 'flex', gap: '10px' }}>
                     {[
@@ -540,6 +591,13 @@ export default function FileDownloaderPage() {
             {!isRunning && downloadUrl && (
               <>
                 <ProgressBar progress={progress} isRunning={false} />
+
+                {stats?.objectTypesFiltered?.length > 0 && (
+                  <div style={{ margin: '10px 0', padding: '8px 10px', background: 'var(--bg-input)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', fontSize: '11.5px', color: 'var(--text-3)' }}>
+                    🔗 Object filter: <strong style={{ color: '#c9d1d9' }}>{stats.objectTypesFiltered.join(', ')}</strong>
+                  </div>
+                )}
+
                 <StatsSummary stats={stats} title="Download Summary" />
                 <button
                   type="button"
