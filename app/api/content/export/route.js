@@ -3,7 +3,7 @@
  * POST /api/content/export
  *
  * Flow:
- *   1. Query all ContentDocuments (paginated)
+ *   1. Query all ContentDocuments (paginated), applying any caller-supplied filters
  *   2. Query ContentVersions in batches of 200 document IDs
  *   3. Query ContentDocumentLink — resolves which SF object/record each file
  *      is attached to. A file can link to multiple records, so values are
@@ -27,6 +27,16 @@
  * Body: {
  *   latestOnly?:    boolean  — download only IsLatest=true (default: false)
  *   maxConcurrent?: number   — parallel downloads, default 10
+ *   filters?: {
+ *     created_from?:   string  — YYYY-MM-DD, maps to CreatedDate >=
+ *     created_to?:     string  — YYYY-MM-DD, maps to CreatedDate <=
+ *     modified_from?:  string  — YYYY-MM-DD, maps to LastModifiedDate >=
+ *     modified_to?:    string  — YYYY-MM-DD, maps to LastModifiedDate <=
+ *     file_type?:      string  — partial match on FileType   (LIKE '%…%')
+ *     file_extension?: string  — partial match on FileExtension (LIKE '%…%')
+ *     title?:          string  — partial match on Title      (LIKE '%…%')
+ *     is_archived?:    'true' | 'false'  — IsArchived = true/false
+ *   }
  * }
  */
 
@@ -53,15 +63,74 @@ function buildFilename(title, docId, versionNumber, fileExtension) {
   return sanitizeFilename(fileExtension ? `${base}.${fileExtension}` : base)
 }
 
+// ── SOQL filter / WHERE-clause builder ───────────────────────────────────────
+
+/**
+ * Escape a value for use inside a SOQL single-quoted string literal.
+ * Prevents injection via text filter fields.
+ */
+function escapeSoqlString(value) {
+  return String(value).replace(/'/g, "\\'")
+}
+
+/**
+ * Convert a YYYY-MM-DD date string to a Salesforce datetime literal.
+ *   'start' → 2024-01-15T00:00:00Z
+ *   'end'   → 2024-01-15T23:59:59Z
+ */
+function toSfDatetime(dateStr, boundary) {
+  const time = boundary === 'end' ? '23:59:59' : '00:00:00'
+  return `${dateStr}T${time}Z`
+}
+
+/**
+ * Build the WHERE clause string from a filters object.
+ * Returns an empty string when no filters are set.
+ *
+ * Mirrors Python's ContentDocumentExporter._build_where_clause().
+ */
+function buildWhereClause(filters = {}) {
+  const conditions = []
+
+  if (filters.created_from) {
+    conditions.push(`CreatedDate >= ${toSfDatetime(filters.created_from, 'start')}`)
+  }
+  if (filters.created_to) {
+    conditions.push(`CreatedDate <= ${toSfDatetime(filters.created_to, 'end')}`)
+  }
+  if (filters.modified_from) {
+    conditions.push(`LastModifiedDate >= ${toSfDatetime(filters.modified_from, 'start')}`)
+  }
+  if (filters.modified_to) {
+    conditions.push(`LastModifiedDate <= ${toSfDatetime(filters.modified_to, 'end')}`)
+  }
+  if (filters.file_type) {
+    conditions.push(`FileType LIKE '%${escapeSoqlString(filters.file_type)}%'`)
+  }
+  if (filters.file_extension) {
+    conditions.push(`FileExtension LIKE '%${escapeSoqlString(filters.file_extension)}%'`)
+  }
+  if (filters.title) {
+    conditions.push(`Title LIKE '%${escapeSoqlString(filters.title)}%'`)
+  }
+  if (filters.is_archived === 'true' || filters.is_archived === 'false') {
+    conditions.push(`IsArchived = ${filters.is_archived}`)
+  }
+
+  return conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+}
+
 // ── Salesforce queries ────────────────────────────────────────────────────────
 
-async function queryContentDocuments(client) {
-  const soql = `
+async function queryContentDocuments(client, filters = {}) {
+  const where = buildWhereClause(filters)
+  const soql  = `
     SELECT Id, Title, FileExtension, FileType, ContentSize,
            CreatedDate, LastModifiedDate, OwnerId, ParentId,
            IsArchived, Description, PublishStatus,
            LatestPublishedVersionId
     FROM ContentDocument
+    ${where}
     ORDER BY CreatedDate DESC
   `
   const { records } = await client.queryAll(soql)
@@ -217,12 +286,32 @@ function buildManifestCSV(versionRows) {
   return rowsToCSV(CSV_HEADERS, rows)
 }
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/** Human-readable summary of which filters are active — logged in the SSE stream. */
+function describeFilters(filters) {
+  if (!filters || Object.keys(filters).length === 0) return 'none'
+  const parts = []
+  if (filters.created_from || filters.created_to) {
+    parts.push(`CreatedDate [${filters.created_from || '*'} → ${filters.created_to || '*'}]`)
+  }
+  if (filters.modified_from || filters.modified_to) {
+    parts.push(`LastModifiedDate [${filters.modified_from || '*'} → ${filters.modified_to || '*'}]`)
+  }
+  if (filters.file_type)      parts.push(`FileType LIKE '%${filters.file_type}%'`)
+  if (filters.file_extension) parts.push(`FileExtension LIKE '%${filters.file_extension}%'`)
+  if (filters.title)          parts.push(`Title LIKE '%${filters.title}%'`)
+  if (filters.is_archived)    parts.push(`IsArchived = ${filters.is_archived}`)
+  return parts.join(', ')
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function POST(request) {
   const {
     latestOnly    = false,
     maxConcurrent = 10,
+    filters       = {},
   } = await request.json()
 
   const session = await getSession()
@@ -244,13 +333,16 @@ export async function POST(request) {
       // ── Step 1: Query ContentDocuments ────────────────────────────────
       emit.info('=== ContentDocument File Downloader ===')
       emit.info(`Mode: ${latestOnly ? 'Latest version only' : 'All versions'} | Concurrency: ${maxConcurrent}`)
+
+      const filterDesc = describeFilters(filters)
+      emit.info(`Filters: ${filterDesc}`)
       emit.info('Querying ContentDocument records…')
 
-      const docs = await queryContentDocuments(client)
+      const docs = await queryContentDocuments(client, filters)
       stats.totalDocuments = docs.length
 
       if (docs.length === 0) {
-        emit.warn('No ContentDocuments found in this org.')
+        emit.warn('No ContentDocuments found matching the current filters.')
         const zip      = new JSZip()
         zip.file('file_manifest.csv', rowsToCSV(CSV_HEADERS, []))
         const buf      = await zip.generateAsync({ type: 'nodebuffer' })
